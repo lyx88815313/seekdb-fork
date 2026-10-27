@@ -789,7 +789,15 @@ int ObService::clear_expired_deadlock_events()
 
 int ObService::load_all_special_system_packages()
 {
-  return pl::ObPLPackageManager::load_all_special_sys_package(*gctx_.sql_proxy_);
+  int ret = pl::ObPLPackageManager::load_all_special_sys_package(*gctx_.sql_proxy_);
+  if (OB_FAIL(ret)) {
+    // The special system packages are part of the asynchronous system package list
+    // as well, so the loading task loads them again later. A failure here must
+    // therefore not break the bootstrap of the observer.
+    LOG_WARN("load special system packages failed, will retry asynchronously", K(ret));
+    ret = OB_SUCCESS;
+  }
+  return ret;
 }
 
 int ObService::refresh_stat_cache(const obcall::ObUpdateStatCacheArg &arg)

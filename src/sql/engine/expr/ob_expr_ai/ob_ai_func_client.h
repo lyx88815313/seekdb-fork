@@ -59,6 +59,8 @@ private:
   bool is_timeout();
 private:
   static const int64_t CURL_MAX_TIMEOUT_SEC;
+  // Margin kept below the statement query timeout for a single AI request.
+  static const int64_t AI_REQUEST_TIMEOUT_MARGIN_US;
   common::ObIAllocator *allocator_;
   char *url_;
   struct curl_slist *header_list_;

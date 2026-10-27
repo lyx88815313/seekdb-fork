@@ -142,6 +142,10 @@ def embed_syspack(syspack_config):
 
 syspack_config = [
     # MySQL
+    # dbms_ai_service is loaded first: the AI model and endpoint DDL are issued by
+    # users right after the observer starts, so the package must be available as
+    # early as possible.
+    SysPackConfig(SysPackGroup.MYSQL, "dbms_ai_service", "dbms_ai_service_mysql.sql", "dbms_ai_service_body_mysql.sql"),
     SysPackConfig(SysPackGroup.MYSQL, "dbms_stats", "dbms_stats_mysql.sql", "dbms_stats_body_mysql.sql"),
     SysPackConfig(SysPackGroup.MYSQL, "dbms_scheduler", "dbms_scheduler_mysql.sql", "dbms_scheduler_mysql_body.sql"),
     SysPackConfig(SysPackGroup.MYSQL, "dbms_ischeduler", "dbms_ischeduler_mysql.sql", "dbms_ischeduler_mysql_body.sql"),
@@ -153,8 +157,13 @@ syspack_config = [
     SysPackConfig(SysPackGroup.MYSQL, "dbms_vector", "dbms_vector_mysql.sql", "dbms_vector_body_mysql.sql"),
     SysPackConfig(SysPackGroup.MYSQL, "dbms_hybrid_search", "dbms_hybrid_vector_mysql.sql", "dbms_hybrid_vector_body_mysql.sql"),
     SysPackConfig(SysPackGroup.MYSQL, "dbms_space", "dbms_space_mysql.sql", "dbms_space_body_mysql.sql"),
-    SysPackConfig(SysPackGroup.MYSQL, "dbms_ai_service", "dbms_ai_service_mysql.sql", "dbms_ai_service_body_mysql.sql"),
     SysPackConfig(SysPackGroup.MYSQL, "dbms_index_manager", "dbms_index_manager_mysql.sql", "dbms_index_manager_body_mysql.sql"),
+
+    # MySQL special
+    # The special packages are loaded synchronously during the bootstrap, so they are
+    # usable as soon as the observer starts serving. dbms_ai_service belongs here:
+    # the AI model DDL must not wait for the whole asynchronous package list.
+    SysPackConfig(SysPackGroup.MYSQL_SPECIAL, "dbms_ai_service", "dbms_ai_service_mysql.sql", "dbms_ai_service_body_mysql.sql"),
 ]
 
 if __name__ == "__main__":

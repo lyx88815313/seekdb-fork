@@ -322,27 +322,44 @@ int ObCallProcedureResolver::resolve(const ParseNode &parse_tree)
                                   ObLibCacheNameSpace::NS_CALLSTMT));
     OX (call_proc_info = static_cast<ObCallProcedureInfo*>(stmt->get_cacheobj_guard().get_cache_obj()));
     CK (OB_NOT_NULL(call_proc_info));
-    // Wait for sys package to be loaded if not ready yet
-    OZ (ObResolverUtils::wait_for_sys_package_ready(*session_info_));
     // Parsing process name
     if (OB_SUCC(ret)) {
       if (T_SP_ACCESS_NAME != name_node->type_) {
         ret = OB_ERR_UNEXPECTED;
       } else {
-        if (OB_FAIL(ObResolverUtils::resolve_sp_access_name(*schema_checker_,
-                                                            session_info_->get_database_name(),
-                                                            *name_node,
-                                                            db_name, package_name, sp_name,
-                                                            nullptr))) {
-        } else if (db_name.empty() && session_info_->get_database_name().empty()) {
+        // The system packages are loaded asynchronously after the observer bootstrap,
+        // so the target package may not be visible yet. Resolve the name first and
+        // only wait for the package loading when the resolution failed: waiting
+        // unconditionally blocked every CALL statement until *all* system packages
+        // were loaded and aborted it with the session query timeout (errno 4012) on
+        // a freshly started instance, which broke the DBMS_AI_SERVICE DDL calls.
+        int resolve_ret = ObResolverUtils::resolve_sp_access_name(*schema_checker_,
+                                                    session_info_->get_database_name(),
+                                                    *name_node,
+                                                    db_name, package_name, sp_name,
+                                                    nullptr);
+        if (OB_SUCCESS != resolve_ret) {
+          // Wait for the system package loading to complete and resolve once more.
+          ret = ObResolverUtils::wait_for_sys_package_ready(*session_info_);
+          if (OB_SUCC(ret)) {
+            resolve_ret = ObResolverUtils::resolve_sp_access_name(*schema_checker_,
+                                                    session_info_->get_database_name(),
+                                                    *name_node,
+                                                    db_name, package_name, sp_name,
+                                                    nullptr);
+            if (OB_SUCCESS != resolve_ret) {
+              ret = resolve_ret;
+            }
+          }
+        }
+        if (OB_SUCC(ret) && db_name.empty() && session_info_->get_database_name().empty()) {
           ret = OB_ERR_NO_DB_SELECTED;
-        } else {
+        } else if (OB_SUCC(ret)) {
           if (!db_name.empty()) {
             OZ (call_proc_info->set_db_name(db_name));
           } else {
             OZ (call_proc_info->set_db_name(session_info_->get_database_name()));
           }
-          
         }
       }
     }

@@ -23,6 +23,8 @@ namespace common
 {
 
 const int64_t ObAIFuncClient::CURL_MAX_TIMEOUT_SEC = INT_MAX/1000;
+// Margin kept below the statement query timeout for a single AI request.
+const int64_t ObAIFuncClient::AI_REQUEST_TIMEOUT_MARGIN_US = 1000000;
 ObAIFuncClient::ObAIFuncClient()
     : allocator_(nullptr), url_(nullptr), header_list_(nullptr),
       curlm_(nullptr), curl_(nullptr), curl_handles_(), response_buffers_() 
@@ -77,6 +79,13 @@ int ObAIFuncClient::init(common::ObIAllocator &allocator, const common::ObString
 {
   int ret = OB_SUCCESS;
   int64_t remain_timeout_us = THIS_WORKER.is_timeout_ts_valid() ? THIS_WORKER.get_timeout_remain() : timeout_sec_ * 1000000;
+  if (THIS_WORKER.is_timeout_ts_valid() && remain_timeout_us > 2 * AI_REQUEST_TIMEOUT_MARGIN_US) {
+    // Leave a margin below the query timeout so that an unresponsive AI
+    // service fails the request instead of the whole statement, and so that
+    // the session gives the tenant schema version back in time for the DDLs
+    // that wait for it.
+    remain_timeout_us -= AI_REQUEST_TIMEOUT_MARGIN_US;
+  }
   if (OB_ISNULL(url) || headers.empty()) {
     ret = OB_INVALID_ARGUMENT;
   } else {
@@ -182,6 +191,9 @@ int ObAIFuncClient::send_post(ObJsonObject *data, ObJsonObject *&response)
               allocator_, response_buf.string(), ObJsonInType::JSON_TREE,
               ObJsonInType::JSON_TREE, j_tree))) {
           ret = OB_ERR_INVALID_JSON_TEXT;
+        } else if (OB_ISNULL(j_tree) || j_tree->json_type() != ObJsonNodeType::J_OBJECT) {
+          ret = OB_INVALID_DATA;
+          FORWARD_USER_ERROR(ret, "AI service response must be a JSON object");
         } else {
           response = static_cast<ObJsonObject *>(j_tree);
         }
@@ -378,6 +390,9 @@ int ObAIFuncClient::get_batch_result(ObArray<ObJsonObject *> &responses)
               allocator_, response_str, ObJsonInType::JSON_TREE,
               ObJsonInType::JSON_TREE, j_tree))) {
         ret = OB_ERR_INVALID_JSON_TEXT;
+      } else if (OB_ISNULL(j_tree) || j_tree->json_type() != ObJsonNodeType::J_OBJECT) {
+        ret = OB_INVALID_DATA;
+        FORWARD_USER_ERROR(ret, "AI service response must be a JSON object");
       } else if (OB_FAIL(responses.push_back(static_cast<ObJsonObject *>(j_tree)))) {
       }
     }

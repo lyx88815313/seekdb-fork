@@ -42,14 +42,25 @@ public:
   virtual bool need_rt_ctx() const override { return true; }
  
 private:
-  static int inner_eval_ai_rerank(common::ObIAllocator &allocator, 
-                                  const common::ObAIFuncExprInfo &info, 
+  static int inner_eval_ai_rerank(common::ObIAllocator &allocator,
+                                  const common::ObAIFuncExprInfo &info,
                                   const share::ObAiModelEndpointInfo &endpoint_info,
-                                  common::ObArray<common::ObString> &header_array, 
-                                  common::ObString &query, 
-                                  common::ObJsonArray *document_array, 
+                                  common::ObArray<common::ObString> &header_array,
+                                  common::ObString &query,
+                                  common::ObJsonArray *document_array,
                                   common::ObJsonArray *&result_array);
-  
+  static int eval_rerank_batches(common::ObIAllocator &allocator,
+                                 const common::ObAIFuncExprInfo &info,
+                                 const share::ObAiModelEndpointInfo &endpoint_info,
+                                 common::ObString &query,
+                                 common::ObJsonArray *document_array,
+                                 common::ObJsonArray *&result_array);
+  static int validate_rerank_results(common::ObJsonArray *result_array,
+                                     int64_t expected_count);
+  static int sort_rerank_results(common::ObIAllocator &allocator,
+                                 common::ObJsonArray *result_array,
+                                 common::ObJsonArray *&sorted_result_array);
+
   static int eval_ai_rerank_with_doc_key(const ObExpr &expr, ObEvalCtx &ctx, common::ObIAllocator &allocator,
                                          common::ObString &model_id, common::ObString &query, common::ObJsonArray *document_array,
                                          common::ObString &doc_key, const common::ObAIFuncExprInfo &info, const share::ObAiModelEndpointInfo &endpoint_info, ObDatum &res);
