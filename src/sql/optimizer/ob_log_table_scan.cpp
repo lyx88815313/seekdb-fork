@@ -704,7 +704,12 @@ int ObLogTableScan::extract_pushdown_filters(ObIArray<ObRawExpr*> &nonpushdown_f
         } else if (is_vec_adaptive_scan()) {
           add_to_scan_filter = true;
         }
-      } else if (is_text_retrieval_scan() && need_text_retrieval_calc_relevance()) {
+      } else if (is_text_retrieval_scan()) {
+        // The filters of a text retrieval scan are evaluated on the documents
+        // that the inverted index returned, so they never reach the storage
+        // layer of the inverted index.  This does not depend on whether the
+        // relevance score is calculated, because the score is always produced
+        // by the retrieval itself.
         if (OB_FAIL(nonpushdown_filters.push_back(filters.at(i)))) {
         } else if (is_vec_adaptive_scan()) {
           add_to_scan_filter = true;

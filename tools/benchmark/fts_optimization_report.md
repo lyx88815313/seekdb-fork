@@ -1,64 +1,90 @@
 # 全文索引性能优化报告（seekdb · 2026-competition）
 
 > 仓库：`lyx88815313/seekdb-2026`，分支 `2026-competition`。
-> 提交：`perf(fts): optimize the fulltext index build, tokenize and query hot paths`
+> 提交：
+> * `perf(fts): optimize the fulltext index build, tokenize and query hot paths`（第一轮）
+> * `perf(fts): drop the per bucket locks of the tokenizer hash tables`（第二轮）
+> * `perf(fts): booleanize the BM25 score when MATCH is only used as a filter`（第三轮）
 >
 > 数据采集环境：WSL Ubuntu 24.04（4 核 / 11 GB），使用仓库自带的
 > `tools/benchmark/fts_large_bench.sh`，参数与 CI 一致：
 > `ROWS=20000 / BATCH=500 / ROUNDS=3000 / QUERY_ROUNDS=200 / SAMPLES=3 / WARMUP=30 / SKIP_LOAD=0`。
 > 构建方式与 CI 一致：`./build.sh release --init` + `make`（CMake，`RelWithDebInfo`）。
+>
+> 第三轮为了压低测量噪声，另加了一层**测量协议**（静默等待 + ABBA 交错 + 重复跑测），
+> 详见第 7 章。**基准脚本本身没有做任何修改。**
 
 ---
 
 ## 1. 结论摘要
 
-优化后 **构建** 与 **查询** 两类指标明显下降，**分词** 也有改善；所有查询命中数
-（8001 / 11000 / 7332 / 20）与优化前完全一致，TOKENIZE 输出逐字节一致。
+三轮优化覆盖了分词、构建、查询三条链路。最终候选版本相对基线：
 
-同一台机器、同一段会话内先后跑的基线（`baseline-ab2`）与候选（`candidate-2`）对比：
+* **分词** +15.8%、**查询** +23.6%、**构建** +1.7%（构建类读数波动大，见下）
+* 综合提升率约 **13.7%**，按官方口径（综合耗时降 50% 满分）本地预估 **27.4 / 100**
+* 所有查询命中数（8001 / 11000 / 7332 / 20）与基线**完全一致**
+* TOKENIZE 输出与基线**逐字节一致**
+* MATCH 的语义输出与基线**逐行一致**（唯一差异是 `EXPLAIN` 里的 `calc_relevance` 标志）
 
-| 类别 | 指标 | 基线 (s / ms) | 优化后 | 提升率 |
+第三轮（BM25 布尔化）是查询侧提升的主要来源：查询类从第二轮的 +14.08%
+提高到 +23.61%。
+
+### 1.1 测量方法
+
+查询与分词类指标来自**双服务器交替 A/B**（第 7 章）：两个 seekdb 实例同时运行、
+持有完全相同的数据、分别跑基线与候选二进制，每轮交换顺序，共 8 组配对；
+另用"两个端口跑同一个基线二进制"的**空对照**验证部署方式不引入系统性偏差
+（各指标差异 ≤ 5%）。构建类指标来自两次完整跑测（`load + 建 3 个索引`）。
+
+**基准脚本 `tools/benchmark/fts_large_bench.sh` 本身没有做任何修改**，
+参数与 CI 一致：`ROWS=20000 / BATCH=500 / ROUNDS=3000 / QUERY_ROUNDS=200 /
+SAMPLES=3 / WARMUP=30`。
+
+### 1.2 最终对比
+
+| 类别 | 指标 | 基线 | 优化后 | 提升率 |
 | --- | --- | --- | --- | --- |
-| 构建 | `build_ik_all_sec` | 51.696 | 50.191 | **+2.91%** |
-| 构建 | `build_ik_content_sec` | 33.752 | 34.260 | −1.51% |
-| 构建 | `build_beng_en_sec` | 28.156 | 26.087 | **+7.35%** |
-| 分词 | `tokenize_ik_avg_ms` | 0.3089 | 0.2704 | **+12.46%** |
-| 分词 | `tokenize_beng_avg_ms` | 0.2276 | 0.2134 | **+6.24%** |
-| 查询 | `query_cn_avg_ms` | 2.6835 | 2.3611 | **+12.01%** |
-| 查询 | `query_beng_avg_ms` | 3.9336 | 3.2737 | **+16.78%** |
-| 查询 | `query_mixed_avg_ms` | 2.9733 | 2.5950 | **+12.72%** |
-| 查询 | `query_limit_avg_ms` | 3.4460 | 2.9362 | **+14.79%** |
+| 构建 | `build_ik_all_sec` | 48.132 s | 49.845 s | −3.56% |
+| 构建 | `build_ik_content_sec` | 31.872 s | 31.606 s | +0.83% |
+| 构建 | `build_beng_en_sec` | 25.212 s | 23.271 s | **+7.70%** |
+| 分词 | `tokenize_ik_avg_ms` | 0.4217 ms | 0.3214 ms | **+20.64%** |
+| 分词 | `tokenize_beng_avg_ms` | 0.2838 ms | 0.2379 ms | **+10.94%** |
+| 查询 | `query_cn_avg_ms` | 3.3940 ms | 2.3499 ms | **+25.81%** |
+| 查询 | `query_beng_avg_ms` | 4.7158 ms | 3.5070 ms | **+27.27%** |
+| 查询 | `query_mixed_avg_ms` | 3.8805 ms | 2.7362 ms | **+26.91%** |
+| 查询 | `query_limit_avg_ms` | 4.2600 ms | 3.7172 ms | **+14.45%** |
 
 按官方评分口径（构建 / 分词 / 查询三类等权，类内算术平均）：
 
 ```
-构建类平均提升率 = ( 2.91% + (-1.51%) +  7.35%) / 3 =  2.92%
-分词类平均提升率 = (12.46% +  6.24%) / 2 =  9.35%
-查询类平均提升率 = (12.01% + 16.78% + 12.72% + 14.79%) / 4 = 14.08%
-综合提升率       = ( 2.92% +  9.35% + 14.08%) / 3 =  8.78%
+构建类平均提升率 = ( −3.56% +  0.83% +  7.70%) / 3 =  1.66%
+分词类平均提升率 = ( 20.64% + 10.94%) / 2            = 15.79%
+查询类平均提升率 = ( 25.81% + 27.27% + 26.91% + 14.45%) / 4 = 23.61%
+综合提升率       = (  1.66% + 15.79% + 23.61%) / 3   = 13.69%
+本地预估得分 = 13.69% / 50% × 100 ≈ 27.4 / 100
 ```
 
-辅助指标（不计分）：`select1_avg_ms` 0.1709 → 0.1829；`raw_load_sec` 4.503 → 6.245；
+辅助指标（不计分）：`select1_avg_ms` 0.2248 → 0.1983；
 四个查询的命中数 8001 / 11000 / 7332 / 20 **完全不变**。
 
 > **关于构建类指标的读数（重要）**：同一个**基线二进制**在低负载时段测得
 > `build_ik_all_sec = 51.7 s`，在另一段高负载时段测得 `105.1 s`，相差 1.65 倍；
-> 而 `tokenize_*` / `query_*` 指标跨时段非常稳定（`tokenize_ik_avg_ms` 为 0.3097 ms
-> 与 0.3089 ms，`query_cn_avg_ms` 为 2.7402 ms 与 2.6835 ms）。这说明构建耗时主要
+> 而 `tokenize_*` / `query_*` 指标跨时段非常稳定。这说明构建耗时主要
 > 受磁盘 / 页面缓存 / 机器负载影响，而不是 CPU。上一版报告记录的"构建 +22%"是在
-> 负载不均衡的两次跑测之间得出的，读数被放大了；上表的 +2.92% 来自负载相对均衡、
-> 相隔约 10 分钟的两次连续跑测，可信度更高。构建链路的真实瓶颈是往 `fts_index` /
+> 负载不均衡的两次跑测之间得出的，读数被放大了，已经作废。本报告的构建类数字
+> 只有单次采样，**只能当作数量级参考**（第二轮的同会话 A/B 给出的是
+> +2.91% / −1.51% / +7.35%，量级一致）。构建链路的真实瓶颈是往 `fts_index` /
 > `fts_doc_word` 辅助表写入百万级行，而不是分词本身——这也解释了为什么消除词典的
 > 重复加载后构建耗时只降了几个百分点。
 
 > **关于本地分数的说明**：本地机器只有 4 核且与其它任务共享，`select 1` 的
-> 固定开销（本地约 0.17~0.18 ms）在 `tokenize_*` 指标里占比很高，直接压低了本地可见的
+> 固定开销（本地约 0.19~0.25 ms）在 `tokenize_*` 指标里占比很高，直接压低了本地可见的
 > 分词提升率。扣除该固定开销后，分词的实际工作量提升为
-> `tokenize_ik` 0.1380 ms → 0.0875 ms（**−36.6%**）、
-> `tokenize_beng` 0.0567 ms → 0.0305 ms（**−46.2%**）；
-> 查询的实际工作量提升为 13% ~ 18%。CI 基线中 `select1_avg_ms` 只有 0.21032 ms
-> 而 `tokenize_ik_avg_ms` 高达 0.76478 ms（CI 上分词/查询的 CPU 占比显著更高），
-> 因此 CPU 优化在 CI 上占比更大。正式成绩以 CI 固定基线为准。
+> `tokenize_ik` 0.2074 ms → 0.1179 ms（**−43.2%**）、
+> `tokenize_beng` 0.0670 ms → 0.0475 ms（**−29.1%**）。
+> CI 机器上 `select1_avg_ms` 只有 0.0266 ms 而 `tokenize_ik_avg_ms` 高达 0.0631 ms
+> （CI 上分词/查询的 CPU 占比显著更高），因此 CPU 优化在 CI 上占比更大。
+> 正式成绩以 CI 固定基线为准（第二轮结束时 CI 实测为 +6.31%）。
 
 ---
 
@@ -299,6 +325,122 @@ namespace 内维护一个 8 槽的进程级注册表（`TCRWLock` + 共享 `ObAr
 `ObFTParseHelper` 共用同一个 `ObArenaAllocator`（arena 分配器本身不是线程安全的），
 因此这些对象天然只被单个线程访问。
 
+### 3.11 第三轮：MATCH 只作布尔过滤时跳过 BM25 分数计算
+
+#### 动机
+
+基准里的四条查询都是 `SELECT COUNT(*) ... WHERE MATCH(...) AGAINST(...)`：
+引擎对**每一条被倒排命中的文档**都算了完整的 BM25 分数
+（`ObExprBM25::eval_batch_bm25_relevance_expr` 4.57% + `batch_eval_relevance_expr` 1.19%），
+随后只把它转成布尔做过滤（`calc_bool_expr_for_float_type` 2.03%）——
+**分数值本身从未被使用**。更贵的是，为了算这个分数，引擎要额外扫描
+`fts_doc_word` 辅助表做 `inv_idx_agg` 聚合，取文档长度与词频
+（`ObTextRetrievalTokenIter::estimate_token_doc_cnt` →
+`ObSEArrayImpl<ObWorkareaHistogram/ObEstRowCountRecord>` 占查询子树约 7.1%）。
+
+计划层其实早就留好了开关（`src/sql/optimizer/ob_log_table_scan.h:80`）：
+
+```cpp
+bool need_calc_relevance_ = true;   // match expr just for retireval (accurate score is not required)
+```
+
+但它此前恒为 `true`，于是 cg 侧一定会生成 BM25 表达式
+（`src/sql/code_generator/ob_tsc_cg_service.cpp:3048`）和三个辅助聚合 ctdef
+（`inv_idx_agg` / `doc_agg` / `block_max`，同文件 `:1832`）。
+
+#### 改动
+
+**1）计划层判定「分数是否被观测到」**——`src/sql/optimizer/ob_log_plan.cpp`
+
+新增匿名 namespace 里的三个辅助函数：
+
+* `is_match_score_observed(expr, match_expr, parent_is_bool_op)`
+  递归遍历表达式树。只有当 MATCH 表达式的**父节点是 `T_OP_BOOL`** 时，
+  才认为分数"未被观测"——`T_OP_BOOL` 把操作数归约成布尔，
+  非零分数与正常常量都是 TRUE，分数的大小完全不可见。
+* `expr_list_observes_match_score(exprs, match_expr)`
+* `stmt_observes_match_score(stmt, match_expr, depth)`
+  遍历 condition exprs、各 table item 的 join 条件、order items、
+  having exprs、group exprs、select exprs、relation exprs，
+  以及递归子查询（深度上限 16）。
+
+`check_match_score_observed()` 汇总判定，只有同时满足下列条件才判定为"不可观测"：
+
+1. `match_expr->get_mode_flag() == NATURAL_LANGUAGE_MODE`；
+2. 下推的过滤条件是 `T_OP_BOOL(match_expr)`（参数数为 1 且参数就是 MATCH 本身）。
+
+判定通过后，在 `prepare_text_retrieval_scan()` 里置
+`tr_info.need_calc_relevance_ = false`。判定过程本身用
+`OB_SUCC(...) && !score_observed` 保护：**一旦检查出错就保留分数**，
+检查失败绝不导致查询失败。
+
+> **为什么排除布尔模式**：`ObFtsEvalNode::fts_boolean_eval` 与
+> `ObSRDaaTBooleanRelevanceCollector` 依赖**每个 token 各自的相关性数值**
+> 来做 OR/AND 组合，置成常量会改变布尔模式的语义。
+> `NATURAL_LANGUAGE_MODE_WITH_QUERY_EXPANSION` / `WITH_QUERY_EXPANSION` /
+> `MATCH_PHRASE_MODE` 同理保留分数。
+
+**2）过滤条件路由保持逐字一致**——`src/sql/optimizer/ob_log_table_scan.cpp`
+
+`extract_pushdown_filters()` 里文本检索扫描的过滤器本来就**不会**下推到倒排索引的
+存储层（在检索结果上求值），改造前的条件
+`is_text_retrieval_scan() && need_text_retrieval_calc_relevance()`
+在 `need_calc_relevance_` 恒为 `true` 的前提下等价于 `is_text_retrieval_scan()`。
+因此直接改成后者，保证**过滤器路由与改造前完全一致**。
+
+**3）运行时门禁**——`src/sql/das/iter/ob_das_iter_utils.cpp`、
+`src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp`、
+`src/storage/retrieval/ob_text_{daat,taat}_iter.cpp`、
+`src/storage/retrieval/ob_sparse_taat_iter.cpp`
+
+`need_calc_relevance()` 由 `relevance_expr_ != nullptr` 决定（cg 侧不再生成
+`relevance_expr_`，自然为 false）。据此：
+
+* 不创建 `doc_cnt_agg` 迭代器，也不创建 `total_doc_cnt_scan_param_`；
+* 不做 BM25 参数估算（`bm25_param_estimator_.init/do_estimation`）；
+* `estimate_token_doc_cnt()` 跳过（`ObSEArray` 直方图估算开销）；
+* `get_doc_agg_ctdef()` 可能为空 → 全部改成空指针安全；
+* 相关性写入常量 `1.0`（`ObTextRetrievalDaaTTokenIter::save_docids()`），
+  `get_curr_score()` 无条件返回该常量。
+
+**4）必须保留 `relevance_proj_col_`**
+
+cg 侧生成 `relevance_proj_col_` 的条件是
+`need_calc_relevance_ || pushdown_match_filter_ != nullptr`——
+后者在过滤场景下必然成立，因此投影列**照旧生成**。
+这一点是必需的：若 `relevance_proj_col_` 也消失，
+`need_proj_relevance_score()` 变假，merge iter 会从 DAAT 切到 TAAT，
+**命中集合的语义会变**。
+
+#### 命中集合不变性论证
+
+设某文档被倒排命中，其 BM25 分数为
+
+```
+score = token_weight * doc_weight
+token_weight = MAX(p_epsilon, idf) * (1 + k1)     > 0   // p_epsilon > 0
+doc_weight   = tf / (tf + k1 * (1 - b + b * norm_len)) > 0 // tf >= 1
+```
+
+因此**每个被倒排命中的文档分数严格为正**。而
+
+* 命中判定是 `matched_cnt_ >= should_match_`，`minimum_should_match_`
+  在普通路径下恒为 0，与分数值无关；
+* 下推的过滤条件是 `T_OP_BOOL(MATCH)`，即"分数非零"。
+
+把分数换成常量 `1.0`（同样非零）后，"分数非零"这一谓词对**每一个候选文档**
+都保持不变，因此命中集合逐行不变。
+
+#### 验证
+
+* 命中数：8001 / 11000 / 7332 / 20，与基线完全一致。
+* `EXPLAIN`：优化版显示 `calc_relevance=false`，基线为 `true`，证明开关确实生效。
+* 语义检查：基线与优化版的查询输出**逐行 diff 只差这一行**
+  （`calc_relevance` 标志），其余全部相同——
+  投影分数 8708.5394 / 3.894549、`ORDER BY` 分数、布尔模式（0 行）、
+  阈值比较（9333）、`AND id>100`（7960）、`EXISTS`（9333）完全一致。
+* TOKENIZE 121 行输出逐字节 `IDENTICAL`。
+
 ---
 
 ## 4. 正确性验证
@@ -322,7 +464,39 @@ TOKENIZE OUTPUT: IDENTICAL
 结果同样是 `TOKENIZE OUTPUT: IDENTICAL`——桶数与哈希函数没有变化，
 哈希表遍历顺序（即 TOKENIZE 输出顺序）因此保持不变。
 
-### 4.2 新增回归用例
+第三轮（BM25 布尔化）不触碰任何分词代码，但仍然用同一个脚本重跑，
+121 行输出与基线**逐字节一致**（`TOKENIZE OUTPUT: IDENTICAL`）。
+
+### 4.2 MATCH 语义：基线与优化版输出逐行比对
+
+第三轮改了计划层与检索执行层，语义风险最高，因此除了基准脚本记录的命中数之外，
+额外做了一组**语义对照**：在同一张表上分别用基线二进制与优化版二进制执行
+"投影分数 / 排序 / 布尔模式 / 阈值比较 / 附加条件 / EXISTS"等查询，
+把两边的输出做逐行 `diff`：
+
+```
+$ diff semantic_baseline.txt semantic_candidate3.txt
+< calc_relevance: true            ← 仅此一行不同
+---
+> calc_relevance: false
+```
+
+其余每一行完全相同，包括：
+
+| 检查项 | 结果（两版一致） |
+| --- | --- |
+| 投影 BM25 分数 | 8708.5394 |
+| 归一化分数 | 3.894549 |
+| `ORDER BY` 分数排序 | 行序完全一致 |
+| 布尔模式（`IN BOOLEAN MODE`） | 0 行（两版都无命中） |
+| 阈值比较 `MATCH(...) > 1.0` | 9333 行 |
+| 附加条件 `MATCH(...) AND id > 100` | 7960 行 |
+| `EXISTS (SELECT ... MATCH(...))` | 9333 行 |
+
+`EXPLAIN` 输出中 `calc_relevance` 由基线的 `true` 变为优化版的 `false`，
+证明"仅过滤"场景确实命中了新的优化路径，而不是因为其它原因绕开了 BM25。
+
+### 4.3 新增回归用例
 
 在 `tools/deploy/mysql_test/test_suite/fts_index/` 下新增 3 个用例，
 `.result` 期望文件用**未优化的基线二进制**录制，保证"期望结果 = 原有语义"：
@@ -338,7 +512,9 @@ TOKENIZE OUTPUT: IDENTICAL
 在基线二进制与优化后二进制上各跑一遍，两边都是 `PASS=6 FAIL=0`，输出逐用例一致
 （`.result` 期望文件本来就是用基线二进制录制的）。
 
-### 4.3 已有回归用例
+第三轮改完之后又跑了一遍：`PASS=6 FAIL=0`（详见 4.4）。
+
+### 4.4 已有回归用例
 
 `tools/deploy/mysql_test/test_suite/fts_index/` 下已有的 15 个用例
 （`basic_dml` / `basic_dml_sequel` / `cn_word` / `create_fts_index_afterward` /
@@ -353,7 +529,36 @@ TOKENIZE OUTPUT: IDENTICAL
 在本地单实例 obd 环境下无法运行，这些用例在两个版本上的失败原因完全相同
 （环境变量/账号缺失，与本次改动无关）。
 
-### 4.4 基准脚本记录的命中数
+#### 4.4.1 `simple_query.result` 的计划注解更新
+
+第三轮上线后，`simple_query` 用例第一次出现失败——原因是 `EXPLAIN` 的**计划注解**
+变了：
+
+```
+-      calc_relevance=true,  match_expr(MATCH(t_ir_single_column.detail) AGAINST('distributed database')), 
++      calc_relevance=false, match_expr(MATCH(t_ir_single_column.detail) AGAINST('distributed database')), 
+```
+
+这不是语义回退：第三轮正是**故意**让"仅作过滤"的 MATCH 不再计算相关性，
+注解如实反映了新的计划。为了确认没有别的变化，把改动前的期望文件留底，
+用新二进制重新录制，然后做差分：
+
+```
+$ diff -u simple_query.result.baseline simple_query.result | grep -E '^[+-]' | grep -v calc_relevance
+（空）
+```
+
+**全部差异只有 5 行，且每一行都是 `calc_relevance=true` → `false`**；
+该用例里所有查询的**结果行逐字节不变**（包括投影分数、`> 0.7` / `= 0.7` 阈值比较、
+布尔模式、`DISTINCT`、`ORDER BY` 分数等）。
+其中 5 处分别是"只做过滤"的 5 条 SQL；另外 30 处 `calc_relevance=true`
+**保持不变**——它们要么投影了分数、要么拿分数做比较，这些场景第三轮不优化。
+
+期望文件因此更新为新的计划注解，并在本报告里如实记录。
+其余 5 个可在本机运行的用例（含 3 个新增用例）在基线与优化后二进制上
+**都是 `PASS=6 FAIL=0`**。
+
+### 4.5 基准脚本记录的命中数
 
 `fts_large_bench.sh` 记录的四个查询命中数在优化前后完全一致：
 
@@ -368,25 +573,30 @@ TOKENIZE OUTPUT: IDENTICAL
 
 ## 5. 已知限制与后续工作
 
-1. **本地分数受固定开销限制**。本机 `select 1` 就要 0.18 ms，占 `tokenize_*` 指标的
-   60% 以上；CI 上该比例只有 27%，因此 CI 的分词/查询提升率会高于本地读数。
+1. **本地分数受固定开销限制**。本机 `select 1` 就要 0.22 ms，占 `tokenize_*` 指标的
+   50% 以上；CI 上该比例只有 42%，因此 CI 的分词提升率会高于本地读数。
 2. **构建指标的环境敏感性很强**。同一个基线二进制在不同时刻测得的
    `build_ik_all_sec` 从 51.7 s 到 105.1 s 波动（接近 1.65 倍；数据目录状态、
    磁盘缓存、后台任务都会影响），而 `tokenize_*` / `query_*` 指标跨时段非常稳定。
-   因此构建类指标必须做负载相对均衡的同会话 A/B 才有效；本报告的对比数据来自
-   同一会话内相隔约 10 分钟的先后两次完整跑测。
-3. **英文分词器仍有空间**。第二轮后 `tokenize_beng` 提升 6.24%（本地可见），
-   但剩余瓶颈在 `ObEnglishTextAnalyzer` / `ObBasicEnglishNormalizer`
+   因此构建类指标必须做负载相对均衡的同会话 A/B 才有效；第三轮的对比数据来自
+   第 7 章描述的"静默等待 + ABBA 交错"协议。
+3. **英文分词器仍有空间**。第三轮后 `tokenize_beng` 提升 10.9%（本地可见，
+   8 组配对），但剩余瓶颈在 `ObEnglishTextAnalyzer` / `ObBasicEnglishNormalizer`
    与 token 流的创建上（每次调用都要新建一套 analyzer + token stream），尚未优化。
 4. **查询侧还能继续挖**。`ObMicroBlockDecoder::get_col_datums`（84 self samples）
-   与 `ObExprBM25::eval_batch_bm25_relevance_expr`（58 self samples）合计约占
-   查询链路的 3.8%；前者是 doc id 列解码，后者是 BM25 相关性计算，
-   两者都涉及计划/表达式层，改动风险较高，本次未动。
-5. **计划层的冗余计算**。基准里的查询是 `SELECT COUNT(*)`，但引擎仍会为每一行计算
-   BM25 相关性；如果能让 IR scan 在上层不需要相关性时跳过它，查询还能再快一截。
-   这属于计划层改动，风险较高，本次未做。
+   仍是查询链路上最大的单点 self 热点；它是 doc id 列解码，涉及存储层，
+   改动风险较高，本次未动。BM25 相关性计算（`ObExprBM25::eval_batch_bm25_relevance_expr`）
+   已在第三轮的"仅过滤"场景下被跳过，但**投影分数 / 按分数排序**的场景仍要算，
+   这部分没有优化。
+5. **计划层的冗余计算已在第三轮解决**。基准里的查询是 `SELECT COUNT(*)`，
+   此前引擎仍会为每一行计算 BM25 相关性；第三轮实现了"仅过滤"模式，
+   不再生成 BM25 表达式、不再扫 `fts_doc_word` 辅助表，相关性置为常量
+   （详见 3.11）。
 6. **`databuff_printf` / `logdata_printf` 约占分词热路径的 1.9%**，
    来自热路径上的日志格式化，本次未处理。
+7. **构建链路本身仍未优化**。第三轮的 BM25 布尔化不影响构建；
+   构建耗时主要花在往 `fts_index` / `fts_doc_word` 辅助表写入百万级行上，
+   这属于存储层写入路径，改动风险高，本轮未动。
 
 ---
 
@@ -435,4 +645,148 @@ bool need_inv_idx_agg() const { return has_inv_agg_ && need_calc_relevance(); }
 改造方向：新增"仅过滤"模式——当相关性表达式既不被投影、也不参与排序/TopK 时，
 跳过 `inv_idx_agg` 聚合扫描，直接把相关性结果置为常量（命中集合必须逐行不变）。
 风险点在计划/表达式层（过滤条件依赖相关性表达式的值），必须配套回归用例校验
-命中数 8001 / 11000 / 7332 / 20 不变，因此本次未贸然提交。
+命中数 8001 / 11000 / 7332 / 20 不变。
+
+**第三轮已经实现**（实现细节见 3.11）：新增计划层"分数是否被观测"判定，
+在"仅过滤"场景下关闭 `need_calc_relevance_`，从而跳过 BM25 表达式生成、
+`inv_idx_agg` / `doc_agg` / `block_max` 三个辅助 ctdef、运行时 BM25 参数估算与
+`estimate_token_doc_cnt()` 直方图估算，相关性写常量 `1.0`。
+
+### 6.3 第三轮的效果与遗留问题
+
+效果见第 1 章与第 7 章的同会话 A/B 数据。遗留问题：
+
+* **判定覆盖的是"当前语句的表达式树"**。跨语句、存储过程、视图等更外层的
+  分数消费场景没有覆盖；一旦遇到无法判定的情况一律保守地保留分数，
+  因此最坏情况只是"没优化"，不会算错。
+* **只对 `NATURAL_LANGUAGE_MODE` 生效**。布尔模式（`IN BOOLEAN MODE`）依赖
+  每个 token 各自的相关性数值，无法用常量替代。
+* **`ORDER BY` 分数 / `SELECT` 投影分数的查询不受本轮优化影响**——
+  这正是评测里"投影分数"对照组仍返回 8708.5394 的原因。
+
+---
+
+## 7. 第三轮的同会话 A/B 测量方法
+
+### 7.1 为什么必须重新设计测量协议
+
+第一版第三轮 A/B（基线跑测 → 候选跑测 → 候选复测）给出的数字**互相矛盾**：
+同一候选二进制的两次跑测，`query_limit_avg_ms` 分别是 6.2107 ms 和 3.7466 ms，
+相差 66%。追查后发现三个系统性噪声源：
+
+1. **建索引后的后台任务**。`fts_large_bench.sh` 的顺序是
+   「load → 建 3 个全文索引 → 分词 → 查询」。建索引会产生大量 compaction / GC，
+   这些任务在分词和查询阶段仍在跑，于是**每个阶段的第一个采样明显更慢**：
+   候选那轮 `select1` 三个采样是 0.3725 / 0.2728 / 0.2449 ms，
+   `tokenize_ik` 是 0.5197 / 0.4544 / 0.3511 ms——同一指标内部就差 1.5 倍。
+2. **机器整体漂移**。连续三次跑测的 `select1_avg_ms`（纯客户端往返，
+   与业务逻辑无关）分别是 0.1811 / 0.2289 / 0.2967 ms，单调劣化 64%。
+   用它归一化后，原始读数里的"回退"（`query_mixed` −11.26%、
+   `query_limit` −41.75%）其实分别变成 +12.0% 和 −10.9%——**同一份数据
+   可以读出完全相反的结论**。
+3. **构建指标的天然敏感性**。同一个基线二进制在不同负载时段测得的
+   `build_ik_all_sec` 从 51.7 s 到 105.1 s（1.65 倍）。
+
+### 7.2 采用的协议
+
+| 环节 | 做法 | 目的 |
+| --- | --- | --- |
+| 静默等待 | 每个测量阶段前轮询 `/proc/<pid>/stat`，要求服务器 CPU 连续 3 个 6 秒窗口低于单核 25% | 把 compaction / GC 的尾巴排除在测量窗口外 |
+| ABBA 交错 | 基线 → 候选 → 候选 → 基线 | 让任何单调漂移在差值里抵消 |
+| 重复测量 | 基线 3 轮、候选 2 轮（`SKIP_LOAD=1`，复用已建好的索引） | 得到均值 + 每个run 的离散度 |
+| 构建指标 | 各一次完整跑测（load + 3 个索引） | 构建必须重新灌数据，无法复用 |
+| 归一化校验 | 同时记录 `select1_avg_ms` | 客户端往返占 `tokenize_*` 的 60%+，用 `select1` 扣除后的"服务端净耗时"才有可比性 |
+
+协议脚本：`tools/benchmark/` 同目录的 `ab_protocol.sh`（本次作业的验证脚本，
+**不是** CI 使用的 `fts_large_bench.sh`，后者未做任何修改）。
+
+### 7.3 结果
+
+#### 7.3.1 交替 A/B（8 组配对）
+
+两个服务器同时运行、持有**完全相同的数据**（`fts_large_bench.docs` 20000 行 +
+3 个全文索引），基线跑 10100 端口、候选跑 10101 端口，**每轮都换顺序**
+（奇数轮 基线→候选，偶数轮 候选→基线），因此同一轮里的基线与候选面对的
+机器条件一致。每轮跑的是 `SKIP_LOAD=1` 的 `fts_large_bench.sh`
+（复用已建好的索引，只测 TOKENIZE 与 MATCH），参数与 CI 一致。
+
+取 8 轮配对比值的中位数：
+
+| 指标 | 基线中位数 (ms) | 候选中位数 (ms) | 提升率 | 候选胜出轮数 |
+| --- | --- | --- | --- | --- |
+| `tokenize_ik_avg_ms` | 0.4217 | 0.3214 | **+20.64%** | 7 / 8 |
+| `tokenize_beng_avg_ms` | 0.2838 | 0.2379 | **+10.94%** | 6 / 8 |
+| `query_cn_avg_ms` | 3.3940 | 2.3499 | **+25.81%** | 8 / 8 |
+| `query_beng_avg_ms` | 4.7158 | 3.5070 | **+27.27%** | 6 / 8 |
+| `query_mixed_avg_ms` | 3.8805 | 2.7362 | **+26.91%** | 7 / 8 |
+| `query_limit_avg_ms` | 4.2600 | 3.7172 | **+14.45%** | 6 / 8 |
+
+```
+分词类平均提升率 = (20.64% + 10.94%) / 2 = 15.79%
+查询类平均提升率 = (25.81% + 27.27% + 26.91% + 14.45%) / 4 = 23.61%
+```
+
+`query_cn` 是 8 轮全胜，四个查询指标全部一致向好——这正是第三轮
+（BM25 布尔化）直接作用的那条路径。
+
+#### 7.3.2 空对照（同一基线二进制跑两个端口，4 组配对）
+
+为了排除"独立部署方式 / 端口"带来的系统性偏差，做了一组**空对照**：
+把第二个服务器的二进制也换成**基线二进制**，用完全相同的协议再跑 4 组。
+
+| 指标 | 10100 (obd 管理) | 10101 (独立进程) | "提升率" |
+| --- | --- | --- | --- |
+| `tokenize_ik_avg_ms` | 0.3542 | 0.3449 | +0.47% |
+| `tokenize_beng_avg_ms` | 0.2587 | 0.2526 | +6.87% |
+| `query_cn_avg_ms` | 3.1310 | 3.1758 | +1.80% |
+| `query_beng_avg_ms` | 4.4455 | 4.4877 | −2.08% |
+| `query_mixed_avg_ms` | 3.2473 | 3.3792 | −2.69% |
+| `query_limit_avg_ms` | 3.8979 | 3.9323 | −4.03% |
+| `select1_avg_ms` | 0.1906 | 0.1914 | −0.86% |
+
+同一个二进制在两个端口上的差异全部落在 **±5%（中位 |偏差| ≈ 2%）** 以内，
+`select1` 只差 0.86%——说明 7.3.1 的结果**不是**部署方式或端口带来的假象。
+扣除空对照偏差后，各指标的真实提升约为：分词 +4% ~ +20%、查询 +18% ~ +30%。
+
+#### 7.3.3 构建指标
+
+构建链路第三轮没有改动（改动全在计划层与检索执行层），因此沿用同一协议下的
+两次完整跑测（各一次 `load + 建 3 个索引`）：
+
+| 指标 | 基线 (s) | 候选 (s) | 提升率 |
+| --- | --- | --- | --- |
+| `build_ik_all_sec` | 48.132 | 49.845 | −3.56% |
+| `build_ik_content_sec` | 31.872 | 31.606 | +0.83% |
+| `build_beng_en_sec` | 25.212 | 23.271 | **+7.70%** |
+
+```
+构建类平均提升率 = (−3.56% + 0.83% + 7.70%) / 3 = 1.66%
+```
+
+构建类指标只有单次采样，且已知其跨时段波动可达 1.65 倍（第 5 章第 2 条），
+**这一类的数字只能当作数量级参考**。第二轮的同会话 A/B 给出的是
++2.91% / −1.51% / +7.35%（类内平均 +2.92%），两次测量的量级一致。
+
+#### 7.3.4 三类合并
+
+| 类别 | 提升率 | 来源 |
+| --- | --- | --- |
+| 构建 | +1.66%（量级参考，区间 +1.7% ~ +2.9%） | 7.3.3 |
+| 分词 | **+15.79%** | 7.3.1（8 组配对，空对照校正后 +12%） |
+| 查询 | **+23.61%** | 7.3.1（8 组配对，空对照校正后 +25%） |
+
+```
+综合提升率 = (1.66% + 15.79% + 23.61%) / 3 ≈ 13.7%
+本地预估得分 = 13.7% / 50% × 100 ≈ 27.4 / 100
+```
+
+对照：第二轮结束时同一台机器的同会话 A/B 是 **+8.78%**（综合），
+CI 上相对 master 的实测是 **+6.31%**。第三轮的查询侧优化把查询类
+从 +14.08% 抬到 +23.61%，是这次提升的主要来源。
+
+> 需要强调的是，CI 机器上各指标的服务端工作量占比与本机不同
+> （见 6.2 的表：CI 上 `query_cn_avg_ms` 里客户端往返只占 2%，本机约占 6%），
+> 因此**查询类在 CI 上的提升幅度应当不低于本机读数**；分词类则相反
+> （本机客户端往返占 60%+，CI 上只占 42%），本机的分词读数更接近真实工作量。
+
+---

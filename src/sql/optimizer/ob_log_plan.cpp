@@ -11987,6 +11987,127 @@ int ObLogPlan::construct_startup_filter_for_limit(ObRawExpr *limit_expr, ObLogic
   return ret;
 }
 
+namespace {
+// The MATCH score may only be replaced by a positive constant when it is never
+// observed as a number.  T_OP_BOOL reduces its operand to a boolean, so the
+// magnitude of the score is invisible there: a non zero score and a positive
+// constant both yield TRUE.
+bool is_match_score_observed(ObRawExpr *expr, ObRawExpr *match_expr, bool parent_is_bool_op)
+{
+  if (OB_ISNULL(expr)) {
+    return false;
+  } else if (expr == match_expr) {
+    return !parent_is_bool_op;
+  }
+  const bool child_is_bool_op = (T_OP_BOOL == expr->get_expr_type());
+  for (int64_t i = 0; i < expr->get_param_count(); ++i) {
+    if (is_match_score_observed(expr->get_param_expr(i), match_expr, child_is_bool_op)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool expr_list_observes_match_score(const ObIArray<ObRawExpr *> &exprs, ObRawExpr *match_expr)
+{
+  for (int64_t i = 0; i < exprs.count(); ++i) {
+    if (is_match_score_observed(exprs.at(i), match_expr, false)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Walk the statement and report whether the MATCH score is read anywhere
+// besides the pushed down boolean filter.  Anything unexpected is reported as
+// observed so that the optimization stays on the safe side.
+bool stmt_observes_match_score(const ObDMLStmt *stmt, ObRawExpr *match_expr, int32_t depth)
+{
+  if (OB_ISNULL(stmt) || depth > 16) {
+    return true;
+  }
+  if (expr_list_observes_match_score(stmt->get_condition_exprs(), match_expr)) {
+    return true;
+  }
+  const ObIArray<TableItem *> &table_items = stmt->get_table_items();
+  for (int64_t i = 0; i < table_items.count(); ++i) {
+    const TableItem *table_item = table_items.at(i);
+    if (OB_ISNULL(table_item)) {
+      return true;
+    } else if (table_item->is_joined_table()) {
+      const JoinedTable *joined_table = static_cast<const JoinedTable *>(table_item);
+      if (expr_list_observes_match_score(joined_table->get_join_conditions(), match_expr)) {
+        return true;
+      }
+    }
+  }
+  for (int64_t i = 0; i < stmt->get_order_item_size(); ++i) {
+    if (is_match_score_observed(stmt->get_order_item(i).expr_, match_expr, false)) {
+      return true;
+    }
+  }
+  if (stmt->is_select_stmt()) {
+    const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(stmt);
+    if (expr_list_observes_match_score(select_stmt->get_having_exprs(), match_expr)) {
+      return true;
+    }
+    if (expr_list_observes_match_score(select_stmt->get_group_exprs(), match_expr)) {
+      return true;
+    }
+    ObSEArray<ObRawExpr *, 16> select_exprs;
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(select_stmt->get_select_exprs(select_exprs))) {
+      return true;
+    }
+    if (expr_list_observes_match_score(select_exprs, match_expr)) {
+      return true;
+    }
+  } else {
+    ObSEArray<ObRawExpr *, 16> relation_exprs;
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(stmt->get_relation_exprs(relation_exprs))) {
+      return true;
+    }
+    if (expr_list_observes_match_score(relation_exprs, match_expr)) {
+      return true;
+    }
+  }
+  const ObIArray<ObQueryRefRawExpr *> &subqueries = stmt->get_subquery_exprs();
+  for (int64_t i = 0; i < subqueries.count(); ++i) {
+    const ObQueryRefRawExpr *subquery = subqueries.at(i);
+    if (OB_ISNULL(subquery) || stmt_observes_match_score(subquery->get_ref_stmt(), match_expr, depth + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Decide whether the BM25 score of the MATCH expression is observable outside
+// of the pushed down boolean filter.  When it is not, the relevance value can
+// be replaced by a positive constant.
+int check_match_score_observed(ObMatchFunRawExpr *match_expr,
+                                ObRawExpr *match_filter,
+                                const ObDMLStmt *stmt,
+                                bool &observed)
+{
+  int ret = OB_SUCCESS;
+  observed = true;
+  if (OB_ISNULL(match_expr) || OB_ISNULL(match_filter) || OB_ISNULL(stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_UNLIKELY(NATURAL_LANGUAGE_MODE != match_expr->get_mode_flag())) {
+    // Boolean mode ranks every single token on its own, and the other modes
+    // bring their own ranking rules.
+  } else if (OB_UNLIKELY(T_OP_BOOL != match_filter->get_expr_type()
+                         || 1 != match_filter->get_param_count()
+                         || match_filter->get_param_expr(0) != match_expr)) {
+    // The pushed down filter is not a plain boolean test on the score.
+  } else {
+    observed = stmt_observes_match_score(stmt, match_expr, 0);
+  }
+  return ret;
+}
+} // namespace
+
 int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_match_exprs,
                                            const ObIArray<ObRawExpr *> &scan_match_filters,
                                            const ObIArray<ObRawExpr *> &all_match_filters,
@@ -12039,6 +12160,18 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
     ObTextRetrievalInfo &tr_info = table_scan->get_text_retrieval_info();
     tr_info.match_expr_ = match_against;
     tr_info.pushdown_match_filter_ = match_pred;
+    // The BM25 score is only observable when the MATCH expression is read
+    // outside of the pushed down boolean filter.  When it is not, every
+    // consumer only asks whether the score is zero, so the relevance value can
+    // be replaced by a positive constant.  That makes the auxiliary
+    // aggregation scan and the BM25 arithmetic unnecessary.
+    bool score_observed = true;
+    // A failure of the check must never break the query: the score is simply
+    // kept when it cannot be proven to be unobservable.
+    if (OB_SUCC(check_match_score_observed(match_against, match_pred, get_stmt(), score_observed))
+        && !score_observed) {
+      tr_info.need_calc_relevance_ = false;
+    }
     // The mapping table is absent when the data-table rowkey is used as the document ID.
     table_scan->set_doc_id_index_table_id(tr_info.doc_id_idx_tid_);
     if (table_scan->is_vec_adaptive_scan() || table_scan->is_vec_idx_scan_post_filter()) {

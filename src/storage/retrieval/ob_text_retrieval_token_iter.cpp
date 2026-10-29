@@ -75,16 +75,23 @@ int ObTextRetrievalTokenIter::init(const ObTextRetrievalScanIterParam &iter_para
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("inv_idx_scan_iter or eval_ctx is NULL", K(ret), K_(inv_idx_scan_iter), KPC_(eval_ctx), KPC_(inv_idx_scan_param), KP(allocator_), KP(mem_context_.ref_context()));
   } else if (!need_calc_relevance()) {
+    // The relevance score is not observed, so the BM25 expressions are absent.
   } else if (OB_ISNULL(relevance_expr_) || OB_ISNULL(inv_idx_agg_expr_) || OB_ISNULL(inv_idx_agg_iter_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_ISNULL(inv_scan_doc_length_col_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(init_calc_exprs_in_relevance_expr())) {
-  } else if (OB_ISNULL(skip_ = sql::to_bit_vector(
-                           allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size_))))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
-    skip_->init(max_batch_size_);
+  }
+  if (OB_SUCC(ret)) {
+    // The skip vector is needed even when the relevance score is not
+    // calculated, because the document ids are collected with it.
+    if (OB_ISNULL(skip_ = sql::to_bit_vector(
+                         allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size_))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      skip_->init(max_batch_size_);
+    }
   }
   is_inited_ = true;
   return ret;
@@ -205,7 +212,7 @@ int ObTextRetrievalTokenIter::get_next_row()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
+  } else if (need_calc_relevance() && !token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
   } else if (OB_FAIL(query::das_scan_next_row(inv_idx_scan_iter_))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
     }
@@ -244,7 +251,7 @@ int ObTextRetrievalTokenIter::get_next_batch(const int64_t capacity, int64_t &co
   count = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
+  } else if (need_calc_relevance() && !token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
   } else if (OB_FAIL(query::das_scan_next_rows(
                  inv_idx_scan_iter_, count, OB_MIN(max_batch_size_, capacity)))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
@@ -304,10 +311,14 @@ int ObTextRetrievalTokenIter::advance_to(const ObDatum &id_datum)
 int ObTextRetrievalTokenIter::update_scan_param(const ObString &token, common::ObArenaAllocator &allocator)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(inv_idx_agg_param_->key_ranges_.count() != 1)) {
+  // The aggregate scan parameter only exists when the relevance score is
+  // calculated.  Both parameters describe the very same range shape, so the
+  // main scan parameter can serve as the template otherwise.
+  const ObTableScanParam *range_param = need_inv_idx_agg() ? inv_idx_agg_param_ : inv_idx_scan_param_;
+  if (OB_UNLIKELY(OB_ISNULL(range_param) || range_param->key_ranges_.count() != 1)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    ObNewRange scan_range = inv_idx_agg_param_->key_ranges_.at(0);
+    ObNewRange scan_range = range_param->key_ranges_.at(0);
     ObObj tmp_obj;
     tmp_obj.set_string(ObVarcharType, token);
     tmp_obj.set_meta_type(scan_range.start_key_.get_obj_ptr()->meta_);
@@ -536,6 +547,9 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
       if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
+        // Without a BM25 score the relevance is a positive constant: the
+        // consumers only ask whether the document matched at all.
+        relevance_.get_data()[i] = 1.0;
         if (OB_FAIL(doc_id_.get_data()[i].from_datum(*doc_id_datum.at(i)))) {
         };
       }
@@ -605,7 +619,9 @@ int ObTextRetrievalDaaTTokenIter::get_curr_score(double &score) const
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(cur_idx_ >= count_)) {
     ret = OB_ARRAY_OUT_OF_RANGE;
-  } else if (relevance_expr_) {
+  } else {
+    // Without a BM25 score the relevance is the positive constant that
+    // save_docids() stored.
     score = relevance_.get_data()[cur_idx_];
   }
   return ret;
