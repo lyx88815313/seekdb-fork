@@ -61,7 +61,11 @@ private:
 
 private:
   ObArenaAllocator alloc_;
-  hash::ObHashMap<int64_t, ObIKTokenChain *> chains_;
+  // The arbitrator is a local object of one tokenize run, so the chain map is
+  // only used by one thread and its buckets do not need a latch.
+  oceanbase::common::hash::ObHashMap<int64_t,
+                                     ObIKTokenChain *,
+                                     oceanbase::common::hash::NoPthreadDefendMode> chains_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObIKArbitrator);

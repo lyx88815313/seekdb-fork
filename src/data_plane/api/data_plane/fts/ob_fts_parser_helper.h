@@ -69,8 +69,10 @@ public:
 
 #define FT_PARSER_TYPE(fts_type, parser_name)                          \
   OB_INLINE bool is_##parser_name() const {                            \
-    ParserType type = fts_type;                                        \
-    return ObFTParserName(NAME_STR[type]) == parser_name_;             \
+    /* The parser name is compared several times per tokenize call, so it  \
+       is compared in place. Building an ObFTParserName here would clear  \
+       and refill its 64 bytes buffer on every single check. */          \
+    return 0 == STRCMP(parser_name_.str(), NAME_STR[fts_type]);         \
   }
   FTS_BUILD_IN_PARSER_LIST
 #undef FT_PARSER_TYPE

@@ -51,7 +51,15 @@ private:
   ObObjMeta meta_;
 };
 
-typedef common::hash::ObHashMap<ObFTWord, int64_t> ObFTWordMap;
+// The word map is filled and read by one thread only: the TOKENIZE path uses a
+// local map and the index build keeps one map per build task. Every word is
+// looked up and stored again, so the bucket latch of the hash table showed up
+// as a measurable part of the tokenization cost. The buckets therefore do not
+// need a latch. The bucket count and the hash function are unchanged, so the
+// iteration order of the map is unchanged as well.
+typedef common::hash::ObHashMap<ObFTWord,
+                                int64_t,
+                                common::hash::NoPthreadDefendMode> ObFTWordMap;
 
 class ObAddWordFlag final
 {
