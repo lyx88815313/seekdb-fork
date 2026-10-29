@@ -333,8 +333,10 @@ TOKENIZE OUTPUT: IDENTICAL
 | `fts_word_map_reuse.test` | 跨文档复用的 word map：每篇文档的词只能归属自己的 doc id；再覆盖 UPDATE / DELETE 后索引的一致性 |
 | `fts_doc_id_compare.test` | doc id 二进制比较：多 token 倒排归并后的 doc id 必须完整、不重不漏，含 LIMIT 与相关性排序 |
 
-3 个用例在两轮优化后的版本上全部通过（rc=0）；本机可运行的既有用例
-`basic_dml_sequel` / `tokenize_function` / `simple_query` 同样全部通过（`PASS=6 FAIL=0`）。
+3 个用例在两轮优化后的版本上全部通过（rc=0）。把这 3 个新增用例与本机可运行的既有用例
+`basic_dml_sequel` / `tokenize_function` / `simple_query` 放在一起，用**完全相同的命令**
+在基线二进制与优化后二进制上各跑一遍，两边都是 `PASS=6 FAIL=0`，输出逐用例一致
+（`.result` 期望文件本来就是用基线二进制录制的）。
 
 ### 4.3 已有回归用例
 
