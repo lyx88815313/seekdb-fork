@@ -21,9 +21,11 @@
 #include "lib/charset/ob_charset.h"
 #include "common/json_type/ob_json_base.h"
 #include "common/json_type/ob_json_tree.h"
+#include "lib/lock/ob_tc_rwlock.h"
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/string/ob_string.h"
+#include "lib/utility/alloc_assist.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "object/ob_object.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
@@ -39,6 +41,90 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+// Cache of the reformatted parser property json.
+//
+// TOKENIZE() reformats the parser property json on every call: the property
+// json is parsed, rebuilt with the parser defaults and serialized again. The
+// result only depends on the parser name and on the raw property json, and
+// the built-in parsers use only a handful of distinct property strings, so
+// the reformatted json is cached instead of being rebuilt every time.
+struct ObFTFormattedPropsEntry
+{
+  ObFTFormattedPropsEntry()
+      : parser_name_(nullptr),
+        parser_name_len_(0),
+        raw_(nullptr),
+        raw_len_(0),
+        formatted_(nullptr),
+        formatted_len_(0),
+        is_used_(false)
+  {
+  }
+  const char *parser_name_;
+  int64_t parser_name_len_;
+  const char *raw_;
+  int64_t raw_len_;
+  const char *formatted_;
+  int64_t formatted_len_;
+  bool is_used_;
+};
+
+constexpr int MAX_FORMATTED_PROPS_CACHE_CNT = 16;
+
+ObFTFormattedPropsEntry *get_formatted_props_cache()
+{
+  static ObFTFormattedPropsEntry cache[MAX_FORMATTED_PROPS_CACHE_CNT];
+  return cache;
+}
+
+common::TCRWLock &get_formatted_props_cache_lock()
+{
+  static common::TCRWLock lock;
+  return lock;
+}
+
+common::ObArenaAllocator &get_formatted_props_cache_alloc()
+{
+  static common::ObArenaAllocator alloc(lib::ObMemAttr("FTFmtProps"));
+  return alloc;
+}
+
+bool is_formatted_props_key_match(const ObFTFormattedPropsEntry &entry,
+                                   const ObString &parser_name,
+                                   const ObString &raw)
+{
+  if (entry.parser_name_len_ != parser_name.length() || entry.raw_len_ != raw.length()) {
+    return false;
+  }
+  if (parser_name.length() > 0 && 0 != memcmp(entry.parser_name_, parser_name.ptr(), parser_name.length())) {
+    return false;
+  }
+  if (raw.length() > 0 && 0 != memcmp(entry.raw_, raw.ptr(), raw.length())) {
+    return false;
+  }
+  return true;
+}
+
+int copy_to_allocator(const ObString &src, common::ObIAllocator &alloc, ObString &dst)
+{
+  int ret = OB_SUCCESS;
+  if (src.empty()) {
+    dst = ObString::make_empty_string();
+  } else {
+    char *buf = static_cast<char *>(alloc.alloc(src.length()));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(buf, src.ptr(), src.length());
+      dst.assign(buf, src.length());
+    }
+  }
+  return ret;
+}
+} // anonymous namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -376,14 +462,74 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
 {
   int ret = OB_SUCCESS;
   storage::ObFTParserJsonProps parser_properties;
+  bool cache_hit = false;
+  // `properties` and `properties_` are the same object here: the reformatted
+  // json overwrites properties_ below, so the raw json is captured first and
+  // used as the cache key.
+  const char *raw_ptr = properties.ptr();
+  const int64_t raw_len = properties.length();
 
-  if (OB_FAIL(parser_properties.init())) {
+  // The reformatted property json only depends on the parser name and on the
+  // raw property json, so it is taken from the cache when possible.
+  {
+    common::TCRLockGuard guard(get_formatted_props_cache_lock());
+    ObFTFormattedPropsEntry *cache = get_formatted_props_cache();
+    for (int64_t i = 0; i < MAX_FORMATTED_PROPS_CACHE_CNT; ++i) {
+      if (cache[i].is_used_ && is_formatted_props_key_match(cache[i], parser_name_, properties)) {
+        ret = copy_to_allocator(ObString(cache[i].formatted_len_, cache[i].formatted_), allocator_, properties_);
+        cache_hit = OB_SUCC(ret);
+        break;
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && cache_hit) {
+    // pass
+  } else if (OB_FAIL(parser_properties.init())) {
   } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
   } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
                                                              ObCollationType::CS_TYPE_UTF8MB4_BIN,
                                                              true))) {
   } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+  } else {
+    // store the result in the cache for the next calls
+    common::TCWLockGuard guard(get_formatted_props_cache_lock());
+    ObFTFormattedPropsEntry *cache = get_formatted_props_cache();
+    ObFTFormattedPropsEntry *slot = nullptr;
+    for (int64_t i = 0; i < MAX_FORMATTED_PROPS_CACHE_CNT; ++i) {
+      if (!cache[i].is_used_) {
+        slot = &cache[i];
+        break;
+      }
+    }
+    if (nullptr != slot) {
+      common::ObArenaAllocator &cache_alloc = get_formatted_props_cache_alloc();
+      char *name_buf = static_cast<char *>(cache_alloc.alloc(parser_name_.length() + 1));
+      char *raw_buf = static_cast<char *>(cache_alloc.alloc(raw_len + 1));
+      char *fmt_buf = static_cast<char *>(cache_alloc.alloc(properties_.length() + 1));
+      if (nullptr != name_buf && nullptr != raw_buf && nullptr != fmt_buf) {
+        if (parser_name_.length() > 0) {
+          MEMCPY(name_buf, parser_name_.ptr(), parser_name_.length());
+        }
+        name_buf[parser_name_.length()] = '\0';
+        if (raw_len > 0) {
+          MEMCPY(raw_buf, raw_ptr, raw_len);
+        }
+        raw_buf[raw_len] = '\0';
+        if (properties_.length() > 0) {
+          MEMCPY(fmt_buf, properties_.ptr(), properties_.length());
+        }
+        fmt_buf[properties_.length()] = '\0';
+        slot->parser_name_ = name_buf;
+        slot->parser_name_len_ = parser_name_.length();
+        slot->raw_ = raw_buf;
+        slot->raw_len_ = raw_len;
+        slot->formatted_ = fmt_buf;
+        slot->formatted_len_ = properties_.length();
+        slot->is_used_ = true;
+      }
+    }
   }
 
   return ret;

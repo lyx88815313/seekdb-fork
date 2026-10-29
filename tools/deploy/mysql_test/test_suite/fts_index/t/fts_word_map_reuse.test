@@ -1,0 +1,62 @@
+# owner: seekdb
+# owner group: storage
+# description: verify that the word map reused across documents of a fulltext
+#              index build does not leak words from one document into another
+
+--disable_warnings
+drop database if exists fts;
+create database fts;
+use fts;
+set ob_query_timeout = 10000000000;
+--enable_warnings
+
+create table t (
+  id int primary key,
+  title varchar(512),
+  body text
+);
+
+insert into t values (1, 'alpha', 'alphabet bravo charlie');
+insert into t values (2, 'bravo', 'bravo charlie delta');
+insert into t values (3, 'charlie', 'delta echo foxtrot');
+insert into t values (4, 'delta', 'foxtrot golf hotel');
+insert into t values (5, 'echo', 'golf hotel india');
+insert into t values (6, '中文标题', '中文正文包含分词器与倒排索引');
+insert into t values (7, '另一个标题', '另一个正文也包含分词器');
+
+--result_format 4
+
+alter table t add fulltext index ft_title(title) with parser beng;
+alter table t add fulltext index ft_body(body) with parser beng;
+
+# every word must only match the documents that really contain it
+select id from t where match(title) against('alpha');
+select id from t where match(title) against('bravo');
+select id from t where match(title) against('charlie');
+select id from t where match(title) against('delta');
+select id from t where match(title) against('echo');
+select id from t where match(body) against('alphabet');
+select id from t where match(body) against('bravo');
+select id from t where match(body) against('charlie');
+select id from t where match(body) against('delta');
+select id from t where match(body) against('echo');
+select id from t where match(body) against('foxtrot');
+select id from t where match(body) against('golf');
+select id from t where match(body) against('hotel');
+select id from t where match(body) against('india');
+select id from t where match(body) against('alphabet bravo charlie delta echo');
+
+# the word counts of the index rows must not be mixed up between documents
+select id, count(*) from t where match(body) against('bravo') group by id order by id;
+
+# updating and deleting a document must keep the index consistent
+update t set body = 'only foxtrot remains' where id = 1;
+select id from t where match(body) against('alphabet');
+select id from t where match(body) against('bravo');
+select id from t where match(body) against('foxtrot');
+delete from t where id = 2;
+select id from t where match(body) against('bravo');
+select id from t where match(body) against('delta');
+
+# the chinese documents share the word 分词器
+select id from t where match(body) against('分词器');

@@ -145,6 +145,7 @@ public:
 private:
   int save_relevances_and_docids();
   int save_docids();
+  int compare_doc_id(const ObDatum &left, const ObDatum &right, int &result);
   ObArenaAllocator *allocator_;
   ObTextRetrievalTokenIter *token_iter_;
   sql::ObEvalCtx *eval_ctx_;
@@ -156,6 +157,9 @@ private:
   ObFixedArray<double, ObIAllocator> relevance_; // when ~ObFixedArray(), wikll destory itself
   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
   common::ObDatumCmpFuncType cmp_func_;
+  // The doc id column is a binary string, so the ids can be compared with a
+  // plain memcmp instead of the generic charset comparison.
+  bool fast_bin_string_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalDaaTTokenIter);
 };

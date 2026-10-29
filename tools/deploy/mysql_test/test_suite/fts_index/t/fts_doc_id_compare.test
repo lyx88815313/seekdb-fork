@@ -1,0 +1,48 @@
+# owner: seekdb
+# owner group: storage
+# description: verify the doc id comparison used when the postings of several
+#              query tokens are merged
+
+--disable_warnings
+drop database if exists fts;
+create database fts;
+use fts;
+set ob_query_timeout = 10000000000;
+--enable_warnings
+
+create table t (
+  id int primary key,
+  title varchar(512),
+  body text
+);
+
+insert into t values (1, 'search engine', 'full text search engine');
+insert into t values (2, 'database index', 'inverted index for database');
+insert into t values (3, 'search database', 'search and database together');
+insert into t values (4, 'search', 'only search here');
+insert into t values (5, 'database', 'only database here');
+insert into t values (6, 'nothing', 'nothing to see');
+
+--result_format 4
+
+alter table t add fulltext index ft_all(title, body) with parser beng;
+
+# a query with several tokens merges several posting lists, the doc ids of the
+# merged result must be complete and unique
+select id from t where match(title, body) against('search database') order by id;
+select id from t where match(title, body) against('search database') order by id;
+select count(*) from t where match(title, body) against('search database');
+select id from t where match(title, body) against('search database') order by id limit 3;
+select id from t where match(title, body) against('search database') order by id limit 20;
+
+# the same query must return the same result when it is executed repeatedly
+select id from t where match(title, body) against('search database') order by id;
+select id from t where match(title, body) against('search database') order by id;
+
+# a single token query
+select id from t where match(title, body) against('search') order by id;
+select id from t where match(title, body) against('database') order by id;
+select id from t where match(title, body) against('engine') order by id;
+
+# relevance ordered result
+select id from t where match(title, body) against('search database') order by match(title, body) against('search database') desc;

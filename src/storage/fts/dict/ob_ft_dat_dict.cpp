@@ -299,30 +299,16 @@ template class ObFTDATReader<void>;
 
 ObArrayHashMap *ObFTDAT::get_map() { return reinterpret_cast<ObArrayHashMap *>(buff); }
 
-int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
-{
-  int ret = OB_ENTRY_NOT_EXIST;
-  uint64_t hash = word.get_word().hash();
-  uint64_t index = hash % header_.capacity_;
-  while (header_.data[index].used) {
-    if (header_.data[index].word == word) {
-      code = header_.data[index].code;
-      ret = OB_SUCCESS;
-      break;
-    } else {
-      index = (index + 3) % header_.capacity_;
-    }
-  }
-  return ret;
-}
-
 int ObArrayHashMap::insert(const ObString &key, ObFTWordCode code)
 {
   int ret = OB_SUCCESS;
-  uint64_t hash = key.hash();
-  uint64_t index = hash % header_.capacity_;
+  const uint32_t capacity = header_.capacity_;
+  uint32_t index = hash_index(hash_word(key.ptr(), key.length()), capacity);
   while (header_.data[index].used) {
-    index = (index + 3) % header_.capacity_;
+    index += 3;
+    if (OB_UNLIKELY(index >= capacity)) {
+      index -= capacity;
+    }
   }
 
   header_.data[index].code = code;

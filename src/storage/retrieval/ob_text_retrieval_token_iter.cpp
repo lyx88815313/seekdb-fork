@@ -16,6 +16,8 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include <cstring>
+
 #include "ob_text_retrieval_token_iter.h"
 #include "query/das/ob_das_iter_access.h"
 #include "share/rc/ob_server_runtime.h"
@@ -413,6 +415,7 @@ ObTextRetrievalDaaTTokenIter::ObTextRetrievalDaaTTokenIter()
     relevance_(),
     doc_id_(),
     cmp_func_(nullptr),
+    fast_bin_string_(false),
     is_inited_(false)
 {
 }
@@ -438,7 +441,13 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
       cmp_func_ = basic_funcs->null_first_cmp_;
       if (OB_ISNULL(cmp_func_)) {
         ret = OB_ERR_UNEXPECTED;
-      } else if (FALSE_IT(relevance_.set_allocator(allocator_))) {
+      } else {
+        // The doc id is compared with the binary collation, so the comparison
+        // is a plain memcmp plus the length difference.
+        const sql::ObDatumMeta &id_meta = inv_scan_domain_id_col_->datum_meta_;
+        fast_bin_string_ = (common::ObVarcharType == id_meta.type_ || common::ObCharType == id_meta.type_);
+      }
+      if (OB_SUCC(ret) && FALSE_IT(relevance_.set_allocator(allocator_))) {
       } else if (OB_FAIL(relevance_.init(max_batch_size_))) {
       } else if (OB_FAIL(relevance_.prepare_allocate(max_batch_size_))) {
       } else if (FALSE_IT(doc_id_.set_allocator(allocator_))) {
@@ -508,8 +517,8 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
       if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        relevance_[i] = relevance_datum.at(i)->get_double();
-        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
+        relevance_.get_data()[i] = relevance_datum.at(i)->get_double();
+        if (OB_FAIL(doc_id_.get_data()[i].from_datum(*doc_id_datum.at(i)))) {
         }
       }
     }
@@ -527,7 +536,7 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
       if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
+        if (OB_FAIL(doc_id_.get_data()[i].from_datum(*doc_id_datum.at(i)))) {
         };
       }
     }
@@ -551,8 +560,7 @@ int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
   }
   while (OB_SUCC(ret) && !find) {
     if (cur_idx_ < count_) {
-      if (OB_FAIL(cmp_func_(
-              id_datum, doc_id_[cur_idx_].get_datum(), result, nullptr))) {
+      if (OB_FAIL(compare_doc_id(id_datum, doc_id_.get_data()[cur_idx_].get_datum(), result))) {
       } else if (result <= 0) {
         find = true;
       } else {
@@ -566,13 +574,28 @@ int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
       }
     } else if (cur_idx_ != 0) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(cmp_func_(
-                   id_datum, doc_id_[cur_idx_].get_datum(), result, nullptr))) {
+    } else if (OB_FAIL(compare_doc_id(id_datum, doc_id_.get_data()[cur_idx_].get_datum(), result))) {
     } else if (result <= 0) {
       find = true;
     } else {
       ret = OB_ERR_UNEXPECTED;
     }
+  }
+  return ret;
+}
+
+int ObTextRetrievalDaaTTokenIter::compare_doc_id(const ObDatum &left, const ObDatum &right, int &result)
+{
+  int ret = OB_SUCCESS;
+  if (OB_LIKELY(fast_bin_string_) && OB_LIKELY(!left.is_null() && !right.is_null())) {
+    // Binary collation comparison: the bytes are compared first and the
+    // length difference breaks the tie when one id is a prefix of the other.
+    // It is the same result as ob_strnncoll_binary(), but without the
+    // charset dispatch.
+    const int64_t min_len = MIN(left.len_, right.len_);
+    const int mem_cmp = (min_len > 0) ? memcmp(left.ptr_, right.ptr_, static_cast<size_t>(min_len)) : 0;
+    result = (0 == mem_cmp) ? static_cast<int>(left.len_ - right.len_) : mem_cmp;
+  } else if (OB_FAIL(cmp_func_(left, right, result, nullptr))) {
   }
   return ret;
 }
@@ -583,7 +606,7 @@ int ObTextRetrievalDaaTTokenIter::get_curr_score(double &score) const
   if (OB_UNLIKELY(cur_idx_ >= count_)) {
     ret = OB_ARRAY_OUT_OF_RANGE;
   } else if (relevance_expr_) {
-    score = relevance_[cur_idx_];
+    score = relevance_.get_data()[cur_idx_];
   }
   return ret;
 }
@@ -594,7 +617,7 @@ int ObTextRetrievalDaaTTokenIter::get_curr_id(const ObDatum *&id_datum) const
   if (OB_UNLIKELY(cur_idx_ >= count_)) {
     ret = OB_ARRAY_OUT_OF_RANGE;
   } else {
-    id_datum = &doc_id_[cur_idx_].get_datum();
+    id_datum = &doc_id_.get_data()[cur_idx_].get_datum();
   }
   return ret;
 }

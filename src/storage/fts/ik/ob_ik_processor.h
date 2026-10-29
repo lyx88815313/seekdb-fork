@@ -101,7 +101,16 @@ public:
 
   virtual ~ObIIKProcessor() {}
 
-  int process(TokenizeContext &ctx);
+  // The current character and its type are resolved once by the caller and
+  // shared by all the segmenters, so that the per-character work is not
+  // repeated for every segmenter.
+  int process(TokenizeContext &ctx,
+              const char *ch,
+              const uint8_t char_len,
+              const ObFTCharUtil::CharType type)
+  {
+    return do_process(ctx, ch, char_len, type);
+  }
 
   virtual int do_process(TokenizeContext &ctx,
                          const char *ch,

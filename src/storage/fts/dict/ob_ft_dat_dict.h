@@ -19,6 +19,7 @@
 
 #include "lib/allocator/ob_allocator.h"
 #include "lib/ob_errno.h"
+#include "lib/utility/alloc_assist.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "ob_ft_dict_def.h"
 #include "storage/fts/dict/ob_ft_dict.h"
@@ -65,7 +66,54 @@ public:
   // no duplicate should be inserted
   int insert(const ObString &key, ObFTWordCode code);
 
-  int find(const ObFTSingleWord &word, ObFTWordCode &code) const;
+  // Inline lookup: cheap word hash and no division in the probe loop.
+  // The lookup is on the tokenizer hot path (once per matched character),
+  // so the hash and the bucket reduction are kept branch-light and free of
+  // the 64 bit division that a plain modulo would cost.
+  int find(const ObFTSingleWord &word, ObFTWordCode &code) const
+  {
+    int ret = OB_ENTRY_NOT_EXIST;
+    const uint32_t capacity = header_.capacity_;
+    uint32_t index = hash_index(hash_word(word.word, word.word_len), capacity);
+    while (header_.data[index].used) {
+      if (header_.data[index].word == word) {
+        code = header_.data[index].code;
+        ret = OB_SUCCESS;
+        break;
+      } else {
+        index += 3;
+        if (OB_UNLIKELY(index >= capacity)) {
+          index -= capacity;
+        }
+      }
+    }
+    return ret;
+  }
+
+  // A word is at most ObCharset::MAX_MB_LEN bytes, so it fits into a register.
+  static OB_INLINE uint64_t hash_word(const char *ptr, const int64_t len)
+  {
+    uint64_t chunk = 0;
+    if (OB_LIKELY(len > 0 && len <= static_cast<int64_t>(sizeof(chunk)))) {
+      MEMCPY(&chunk, ptr, static_cast<size_t>(len));
+    } else {
+      for (int64_t i = 0; i < len; ++i) {
+        chunk = (chunk << 8) | static_cast<unsigned char>(ptr[i]);
+      }
+    }
+    uint64_t hash = chunk ^ (static_cast<uint64_t>(len) * 0x9E3779B97F4A7C15ULL);
+    hash ^= hash >> 29;
+    hash *= 0xBF58476D1CE4E5B9ULL;
+    hash ^= hash >> 32;
+    return hash;
+  }
+
+  // Multiply-shift reduction: the result is in [0, capacity) and, unlike a
+  // modulo, it does not need a division.
+  static OB_INLINE uint32_t hash_index(const uint64_t hash, const uint32_t capacity)
+  {
+    return static_cast<uint32_t>((static_cast<unsigned __int128>(hash) * capacity) >> 64);
+  }
 
 private:
   struct Header header_;

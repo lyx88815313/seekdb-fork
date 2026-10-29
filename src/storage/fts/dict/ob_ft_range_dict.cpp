@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <cstring>
+
 #include "storage/fts/dict/ob_ft_range_dict.h"
 #include "share/rc/ob_server_runtime.h"
 
@@ -21,6 +23,7 @@
 #include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "common/mysqlclient/ob_isql_client.h"
+#include "lib/lock/ob_tc_rwlock.h"
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_macro_utils.h"
@@ -43,6 +46,51 @@ namespace oceanbase
 {
 namespace storage
 {
+namespace
+{
+// Same result as ObCharset::strcmp(CS_TYPE_UTF8MB4_BIN, l, r): the binary
+// collation compares the bytes first and falls back to the length difference
+// when one string is a prefix of the other. See ob_strnncoll_mb_bin.
+inline int ft_bin_strcmp(const ObString &l, const ObString &r)
+{
+  const int64_t min_len = MIN(l.length(), r.length());
+  int cmp_ret = (min_len > 0) ? memcmp(l.ptr(), r.ptr(), static_cast<size_t>(min_len)) : 0;
+  if (0 == cmp_ret) {
+    cmp_ret = static_cast<int>(l.length() - r.length());
+  }
+  return cmp_ret;
+}
+
+// The built-in dictionaries are immutable, so one instance per dict type is
+// shared by the whole process.
+constexpr int MAX_SHARED_DICT_CNT = 8;
+
+struct ObFTSharedDictEntry
+{
+  ObFTSharedDictEntry() : type_(ObFTDictType::DICT_TYPE_INVALID), container_(nullptr), dict_(nullptr) {}
+  ObFTDictType type_;
+  ObFTCacheRangeContainer *container_;
+  ObFTRangeDict *dict_;
+};
+
+ObFTSharedDictEntry *get_shared_dict_entries()
+{
+  static ObFTSharedDictEntry entries[MAX_SHARED_DICT_CNT];
+  return entries;
+}
+
+common::TCRWLock &get_shared_dict_lock()
+{
+  static common::TCRWLock lock;
+  return lock;
+}
+
+ObArenaAllocator &get_shared_dict_alloc()
+{
+  static ObArenaAllocator alloc(lib::ObMemAttr("FTSharedDict"));
+  return alloc;
+}
+} // anonymous namespace
 
 
 int ObFTRangeDict::build_cache_from_ik_dict(const ObFTDictDesc &desc, ObFTCacheRangeContainer &range_container)
@@ -381,23 +429,91 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
-  bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
-      found = true;
+  // The ranges are built in ascending order of their start word, so the
+  // candidate range can be found with a binary search instead of a linear
+  // scan over every range.
+  int64_t low = 0;
+  int64_t high = range_dicts_.size() - 1;
+  int64_t found = -1;
+  while (low <= high) {
+    const int64_t mid = low + (high - low) / 2;
+    if (ft_bin_strcmp(range_dicts_[mid].start_.get_word(), single_word) <= 0) {
+      found = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
     }
   }
-  if (!found) {
+  if (found >= 0 && ft_bin_strcmp(range_dicts_[found].end_.get_word(), single_word) >= 0) {
+    dict = range_dicts_[found].dict_;
+  } else {
     // not found, dis match
     ret = OB_ENTRY_NOT_EXIST;
+  }
+  return ret;
+}
+
+int ObFTRangeDict::get_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  ObFTRangeDict *range_dict = nullptr;
+  dict = nullptr;
+  ObFTSharedDictEntry *entries = get_shared_dict_entries();
+  {
+    // Fast path: the shared dict is created once and never replaced, so it can
+    // be read under the shared lock.
+    common::TCRLockGuard guard(get_shared_dict_lock());
+    for (int64_t i = 0; i < MAX_SHARED_DICT_CNT && nullptr == range_dict; ++i) {
+      if (entries[i].type_ == desc.type_ && nullptr != entries[i].dict_) {
+        range_dict = entries[i].dict_;
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && nullptr == range_dict) {
+    // Slow path: build the shared dict once, other threads wait for it.
+    common::TCWLockGuard guard(get_shared_dict_lock());
+    if (OB_UNLIKELY(!guard.get_ret())) {
+      ret = guard.get_ret();
+    }
+    ObFTSharedDictEntry *entry = nullptr;
+    for (int64_t i = 0; i < MAX_SHARED_DICT_CNT && nullptr == entry; ++i) {
+      if (entries[i].type_ == desc.type_) {
+        entry = &entries[i];
+      }
+    }
+    if (nullptr == entry) {
+      for (int64_t i = 0; i < MAX_SHARED_DICT_CNT && nullptr == entry; ++i) {
+        if (ObFTDictType::DICT_TYPE_INVALID == entries[i].type_) {
+          entry = &entries[i];
+        }
+      }
+    }
+    if (nullptr == entry) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("no free slot for the shared fulltext dict", K(ret), K(desc.type_));
+    } else {
+      ObFTCacheRangeContainer *container = nullptr;
+      ObArenaAllocator &alloc = get_shared_dict_alloc();
+      if (OB_ISNULL(container = OB_NEWx(ObFTCacheRangeContainer, &alloc, alloc))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(ObFTRangeDict::build_cache_from_ik_dict(desc, *container))) {
+        LOG_WARN("failed to build the shared fulltext dict", K(ret), K(desc.type_));
+      } else if (OB_ISNULL(range_dict = OB_NEWx(ObFTRangeDict, &alloc, alloc, container, desc))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(range_dict->init())) {
+        range_dict->~ObFTRangeDict();
+        range_dict = nullptr;
+      } else {
+        entry->type_ = desc.type_;
+        entry->container_ = container;
+        entry->dict_ = range_dict;
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && nullptr != range_dict) {
+    dict = range_dict;
   }
   return ret;
 }

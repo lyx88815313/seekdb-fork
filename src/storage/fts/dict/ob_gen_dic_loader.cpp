@@ -125,20 +125,38 @@ int ObGenDicLoader::get_dic_loader(const ObString &parser_name,
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(dic_loader_key.init(parser_name, charset))) {
   } else {
-    TCWLockGuard guard(lock_);
-    if (OB_FAIL(dic_loader_map_.get_refactored(dic_loader_key, dic_loader))) {
-      if (OB_HASH_NOT_EXIST == ret) {
-        if (OB_FAIL(gen_dic_loader(dic_loader_key, dic_loader))) {
-        } else if (OB_ISNULL(dic_loader)) {
-          ret = OB_ERR_UNEXPECTED;
-        } else if (OB_FAIL(dic_loader_map_.set_refactored(dic_loader_key, dic_loader))) {
-        } else if (OB_FALSE_IT(dic_loader->inc_ref())) {
-        } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+    bool found = false;
+    {
+      // Fast path: a dic loader is created once and never removed, so it can be
+      // read under the shared lock instead of serializing every caller on the
+      // write lock. This is on the tokenize hot path.
+      TCRLockGuard guard(lock_);
+      const int get_ret = dic_loader_map_.get_refactored(dic_loader_key, dic_loader);
+      if (OB_SUCCESS == get_ret) {
+        found = true;
+        if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
         }
-      } else {
+      } else if (OB_HASH_NOT_EXIST != get_ret) {
         ret = OB_ERR_UNEXPECTED;
       }
-    } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+    }
+    if (OB_FAIL(ret)) {
+    } else if (!found) {
+      TCWLockGuard guard(lock_);
+      const int get_ret = dic_loader_map_.get_refactored(dic_loader_key, dic_loader);
+      if (OB_SUCCESS == get_ret) {
+        // created by another thread while we waited for the write lock
+        if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+        }
+      } else if (OB_HASH_NOT_EXIST != get_ret) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(gen_dic_loader(dic_loader_key, dic_loader))) {
+      } else if (OB_ISNULL(dic_loader)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(dic_loader_map_.set_refactored(dic_loader_key, dic_loader))) {
+      } else if (OB_FALSE_IT(dic_loader->inc_ref())) {
+      } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+      }
     }
   }
   return ret;

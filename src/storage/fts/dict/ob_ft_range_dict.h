@@ -70,6 +70,21 @@ public:
 
   static int build_cache_from_ik_dict(const ObFTDictDesc &desc, ObFTCacheRangeContainer &range_container);
 
+  /**
+   * @brief Get the process-wide shared range dict of the given dict type.
+   *
+   * The built-in dictionaries never change at runtime, so the range dict and
+   * the cache blocks it points to are built once and then shared by every
+   * parser instance. Sharing avoids rebuilding the range table (and re-looking
+   * up every range in the kv cache) on each tokenize/index-build call, which is
+   * the dominant cost of the tokenizer hot path.
+   *
+   * The returned dict is owned by the registry and lives until the process
+   * exits; the caller must not free it. It is read-only after construction,
+   * so it can be used concurrently by multiple threads.
+   */
+  static int get_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict);
+
 private:
   // build cache
   static int build_ranges(const ObFTDictDesc &desc,

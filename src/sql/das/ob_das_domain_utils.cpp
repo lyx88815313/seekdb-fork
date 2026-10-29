@@ -36,6 +36,12 @@ namespace sql
 {
 using storage::ObFTWordMap;
 
+// Initial bucket count of the word map that is reused across the documents of
+// an index build. The map grows on demand, so a moderate initial size avoids
+// both the repeated rehash of a too small map and the over-allocation of a
+// too large one.
+static constexpr int64_t FT_WORD_MAP_INIT_BUCKET_CNT = 64;
+
 
 ObObjDatumMapType ObFTIndexRowCache::FTS_INDEX_TYPES[] = {OBJ_DATUM_STRING, OBJ_DATUM_STRING, OBJ_DATUM_8BYTE_DATA, OBJ_DATUM_8BYTE_DATA};
 ObObjDatumMapType ObFTIndexRowCache::FTS_DOC_WORD_TYPES[] = {OBJ_DATUM_STRING, OBJ_DATUM_STRING, OBJ_DATUM_8BYTE_DATA, OBJ_DATUM_8BYTE_DATA};
@@ -69,6 +75,7 @@ int ObFTIndexRowCache::init(
     ret = OB_INIT_TWICE;
   } else if (OB_FAIL(CURRENT_CONTEXT->CREATE_CONTEXT(merge_memctx_, param))) {
   } else if (OB_FAIL(helper_.init(&(merge_memctx_->get_arena_allocator()), parser_name, parser_properties))) {
+  } else if (OB_FAIL(word_map_.create(FT_WORD_MAP_INIT_BUCKET_CNT, common::ObMemAttr("FTWordMap")))) {
   } else {
     row_idx_ = 0;
     is_fts_index_aux_ = is_fts_index_aux;
@@ -89,6 +96,7 @@ int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
     ret = OB_NOT_INIT;
   } else if (FALSE_IT(reuse())) {
   } else if (OB_FAIL(ObDASDomainUtils::generate_fulltext_word_rows(merge_memctx_->get_arena_allocator(),
+                                                                   word_map_,
                                                                    &helper_,
                                                                    ft_obj_meta,
                                                                    doc_id_datum,
@@ -126,6 +134,9 @@ void ObFTIndexRowCache::reset()
   if (OB_NOT_NULL(merge_memctx_)) {
     DESTROY_CONTEXT(merge_memctx_);
     merge_memctx_ = nullptr;
+  }
+  if (word_map_.created()) {
+    word_map_.destroy();
   }
   is_inited_ = false;
 }
@@ -275,6 +286,7 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
 }
 
 /*static*/ int ObDASDomainUtils::generate_fulltext_word_rows(common::ObIAllocator &allocator,
+                                                             storage::ObFTWordMap &ft_word_map,
                                                              storage::ObFTParseHelper *helper,
                                                              const common::ObObjMeta &ft_obj_meta,
                                                              const ObDatum &doc_id_datum,
@@ -284,17 +296,17 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
 {
   int ret = OB_SUCCESS;
   static int64_t FT_WORD_DOC_COL_CNT = 4;
-  static constexpr int64_t FT_MAX_WORD_BUCKET = 997;
-  const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 10, 2), FT_MAX_WORD_BUCKET);
   int64_t doc_length = 0;
-  ObFTWordMap ft_word_map;
   void *rows_buf = nullptr;
   blocksstable::ObDatumRow *rows = nullptr;
   if (OB_ISNULL(helper) || OB_UNLIKELY(!ft_obj_meta.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (0 == fulltext.length()) {
     ret = OB_ITER_END;
-  } else if (OB_FAIL(ft_word_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+  } else if (OB_FAIL(ft_word_map.reuse())) {
+    // the map is reused across documents, it must be emptied before the new
+    // document is segmented
+    ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(segment_and_calc_word_count(allocator,
                                                  helper,
                                                  ft_obj_meta,
@@ -844,6 +856,9 @@ void ObFTDMLIterator::reset()
   is_inited_ = false;
   data_plane::reset_ft_doc_word_iterator(ft_doc_word_iter_);
   ft_parse_helper_.reset();
+  if (ft_word_map_.created()) {
+    ft_word_map_.destroy();
+  }
   ObDomainDMLIterator::reset();
 }
 
@@ -902,6 +917,7 @@ int ObFTDMLIterator::init(
   } else if (OB_ISNULL(ft_doc_word_iter_)
              && OB_FAIL(data_plane::create_ft_doc_word_iterator(
                     ft_doc_word_allocator_, ft_doc_word_iter_))) {
+  } else if (OB_FAIL(ft_word_map_.create(FT_WORD_MAP_INIT_BUCKET_CNT, common::ObMemAttr("FTWordMap")))) {
   } else {
     switch (mode_) {
       case ObDomainDMLMode::DOMAIN_DML_MODE_DEFAULT: {
@@ -1028,6 +1044,7 @@ int ObFTDMLIterator::generate_ft_word_rows(const ObChunkDatumStore::StoredRow *s
   if (!is_update_ && OB_FAIL(get_ft_and_doc_id(store_row, doc_id_datum, ft, ft_meta))) {
   } else if (is_update_ && OB_FAIL(get_ft_and_doc_id_for_update(store_row, doc_id_datum, ft, ft_meta))) {
   } else if (OB_FAIL(ObDASDomainUtils::generate_fulltext_word_rows(allocator_,
+                                                                   ft_word_map_,
                                                                    &ft_parse_helper_,
                                                                    ft_meta,
                                                                    doc_id_datum,
@@ -1111,6 +1128,7 @@ int ObFTDMLIterator::scan_ft_word_rows(const ObChunkDatumStore::StoredRow *store
     } else if (!is_update_ && OB_FAIL(get_ft_and_doc_id(store_row, check_id_datum, ft, ft_meta))) {
     } else if (is_update_ && OB_FAIL(get_ft_and_doc_id_for_update(store_row, check_id_datum, ft, ft_meta))) {
     } else if (OB_FAIL(ObDASDomainUtils::generate_fulltext_word_rows(allocator,
+                                                                     ft_word_map_,
                                                                      &ft_parse_helper,
                                                                      ft_meta,
                                                                      check_id_datum,

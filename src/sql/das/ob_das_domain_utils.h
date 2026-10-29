@@ -58,6 +58,9 @@ private:
   uint64_t row_idx_;
   bool is_fts_index_aux_;
   storage::ObFTParseHelper helper_;
+  // The word map is reused across the documents of an index build: creating a
+  // hash map for every document is a significant part of the build cost.
+  storage::ObFTWordMap word_map_;
   bool is_inited_;
 
   DISALLOW_COPY_AND_ASSIGN(ObFTIndexRowCache);
@@ -181,6 +184,7 @@ public:
       const ObDASWriteBuffer::DmlRow &dml_row,
       ObDomainIndexRow &spat_rows);
   static int generate_fulltext_word_rows(common::ObIAllocator &allocator,
+                                         storage::ObFTWordMap &word_map,
                                          storage::ObFTParseHelper *helper,
                                          const common::ObObjMeta &ft_obj_meta,
                                          const ObDatum &doc_id_datum,
@@ -393,6 +397,8 @@ private:
   data_plane::ObFTDocWordIterator *ft_doc_word_iter_;
   common::ObArenaAllocator ft_doc_word_allocator_;
   storage::ObFTParseHelper ft_parse_helper_;
+  // The word map is reused across the rows of a dml statement.
+  storage::ObFTWordMap ft_word_map_;
   bool is_inited_;
 };
 

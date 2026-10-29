@@ -19,10 +19,13 @@
 #include "common/json_type/ob_json_base.h"
 #include "common/json_type/ob_json_parse.h"
 #include "common/json_type/ob_json_tree.h"
+#include "lib/allocator/page_arena.h"
 #include "lib/list/ob_dlist.h"
+#include "lib/lock/ob_tc_rwlock.h"
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/string/ob_string.h"
+#include "lib/utility/alloc_assist.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "lib/utility/ob_print_utils.h"
 #include "storage/fts/ob_fts_literal.h"
@@ -34,6 +37,126 @@ namespace oceanbase
 {
 namespace storage
 {
+namespace
+{
+// Cache of the parsed parser properties.
+//
+// Parsing the parser property json is on the tokenize hot path: it is done for
+// every TOKENIZE() call and for every document of an index build. The parsed
+// result only depends on the parser name and on the property json, and the
+// built-in parsers use only a handful of distinct property strings, so the
+// parsed result is cached instead of being parsed over and over again.
+struct ObFTParserPropertyCacheEntry
+{
+  ObFTParserPropertyCacheEntry()
+      : parser_name_(nullptr),
+        parser_name_len_(0),
+        json_str_(nullptr),
+        json_str_len_(0),
+        property_(),
+        is_used_(false)
+  {
+  }
+  const char *parser_name_;
+  int64_t parser_name_len_;
+  const char *json_str_;
+  int64_t json_str_len_;
+  ObFTParserProperty property_;
+  bool is_used_;
+};
+
+constexpr int MAX_PARSER_PROPERTY_CACHE_CNT = 16;
+
+ObFTParserPropertyCacheEntry *get_parser_property_cache()
+{
+  static ObFTParserPropertyCacheEntry cache[MAX_PARSER_PROPERTY_CACHE_CNT];
+  return cache;
+}
+
+common::TCRWLock &get_parser_property_cache_lock()
+{
+  static common::TCRWLock lock;
+  return lock;
+}
+
+ObArenaAllocator &get_parser_property_cache_alloc()
+{
+  static ObArenaAllocator alloc(lib::ObMemAttr("FTPropCache"));
+  return alloc;
+}
+
+bool is_cache_key_match(const ObFTParserPropertyCacheEntry &entry,
+                         const ObString &parser_name,
+                         const ObString &json_str)
+{
+  if (entry.parser_name_len_ != parser_name.length() || entry.json_str_len_ != json_str.length()) {
+    return false;
+  }
+  if (parser_name.length() > 0 && 0 != memcmp(entry.parser_name_, parser_name.ptr(), parser_name.length())) {
+    return false;
+  }
+  if (json_str.length() > 0 && 0 != memcmp(entry.json_str_, json_str.ptr(), json_str.length())) {
+    return false;
+  }
+  return true;
+}
+
+bool get_cached_parser_property(const ObString &parser_name,
+                                 const ObString &json_str,
+                                 ObFTParserProperty &property)
+{
+  bool found = false;
+  common::TCRLockGuard guard(get_parser_property_cache_lock());
+  ObFTParserPropertyCacheEntry *cache = get_parser_property_cache();
+  for (int64_t i = 0; i < MAX_PARSER_PROPERTY_CACHE_CNT; ++i) {
+    if (cache[i].is_used_ && is_cache_key_match(cache[i], parser_name, json_str)) {
+      property = cache[i].property_;
+      found = true;
+      break;
+    }
+  }
+  return found;
+}
+
+void put_cached_parser_property(const ObString &parser_name,
+                                 const ObString &json_str,
+                                 const ObFTParserProperty &property)
+{
+  common::TCWLockGuard guard(get_parser_property_cache_lock());
+  ObFTParserPropertyCacheEntry *cache = get_parser_property_cache();
+  ObFTParserPropertyCacheEntry *slot = nullptr;
+  for (int64_t i = 0; i < MAX_PARSER_PROPERTY_CACHE_CNT; ++i) {
+    if (!cache[i].is_used_) {
+      slot = &cache[i];
+      break;
+    }
+  }
+  if (nullptr == slot) {
+    // the cache is full, do not cache this one
+    return;
+  }
+  ObArenaAllocator &alloc = get_parser_property_cache_alloc();
+  char *name_buf = static_cast<char *>(alloc.alloc(parser_name.length() + 1));
+  char *json_buf = static_cast<char *>(alloc.alloc(json_str.length() + 1));
+  if (nullptr == name_buf || nullptr == json_buf) {
+    return;
+  }
+  if (parser_name.length() > 0) {
+    MEMCPY(name_buf, parser_name.ptr(), parser_name.length());
+  }
+  name_buf[parser_name.length()] = '\0';
+  if (json_str.length() > 0) {
+    MEMCPY(json_buf, json_str.ptr(), json_str.length());
+  }
+  json_buf[json_str.length()] = '\0';
+  slot->parser_name_ = name_buf;
+  slot->parser_name_len_ = parser_name.length();
+  slot->json_str_ = json_buf;
+  slot->json_str_len_ = json_str.length();
+  slot->property_ = property;
+  slot->is_used_ = true;
+}
+} // anonymous namespace
 
 
 int ObFTParserJsonProps::init()
@@ -1016,6 +1139,17 @@ int ObFTParserJsonProps::show_parser_properties(const ObFTParserJsonProps &prope
 int ObFTParserProperty::parse_for_parser_helper(const ObFTParser &parser, const ObString &json_str)
 {
   int ret = OB_SUCCESS;
+  const ObFTParserName &parser_name = parser.get_parser_name();
+  const ObString parser_name_str(parser_name.len(), parser_name.str());
+  ObFTParserProperty cached_property;
+  if (get_cached_parser_property(parser_name_str, json_str, cached_property)) {
+    *this = cached_property;
+    return OB_SUCCESS;
+  }
+  // Start from the default values so that the result only depends on the
+  // parser and on the property json. The cached result must be the same no
+  // matter which object it was parsed into.
+  *this = ObFTParserProperty();
   ObFTParserJsonProps props;
   if (OB_FAIL(props.init())) {
   } else if (OB_FAIL(props.parse_from_valid_str(json_str))) {
@@ -1063,6 +1197,9 @@ int ObFTParserProperty::parse_for_parser_helper(const ObFTParser &parser, const 
       } else if (OB_FAIL(props.config_get_max_ngram_token_size(max_ngram_token_size_))) {
       }
     }
+  }
+  if (OB_SUCC(ret)) {
+    put_cached_parser_property(parser_name_str, json_str, *this);
   }
   return ret;
 }

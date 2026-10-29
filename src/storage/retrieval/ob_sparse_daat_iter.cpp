@@ -16,6 +16,8 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include <cstring>
+
 #include "ob_sparse_daat_iter.h"
 
 namespace oceanbase
@@ -23,10 +25,25 @@ namespace oceanbase
 namespace storage
 {
 
+// Binary collation comparison of two string datums.
+//
+// It reproduces ob_strnncoll_binary()/ob_strnncoll_mb_bin() exactly: the
+// bytes are compared first and the length difference breaks the tie when one
+// string is a prefix of the other. Both are used by the generic datum
+// comparison, but they go through the charset dispatch, which is a measurable
+// cost when the merge heap compares the doc ids of every output row.
+inline int64_t bin_string_cmp(const ObDatum &left, const ObDatum &right)
+{
+  const int64_t min_len = MIN(left.len_, right.len_);
+  const int mem_cmp = (min_len > 0) ? memcmp(left.ptr_, right.ptr_, static_cast<size_t>(min_len)) : 0;
+  return (0 == mem_cmp) ? (static_cast<int64_t>(left.len_) - static_cast<int64_t>(right.len_)) : mem_cmp;
+}
+
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
     iter_ids_(nullptr),
-    is_inited_(false)
+    is_inited_(false),
+    fast_bin_string_(false)
 {
 }
 
@@ -44,6 +61,11 @@ int ObSRMergeCmp::init(
     if (OB_ISNULL(cmp_func_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
+      // The doc id column is a binary string, so the comparison is a plain
+      // memcmp plus the length difference.
+      fast_bin_string_ = (common::ObVarcharType == id_meta.type_ || common::ObCharType == id_meta.type_)
+                         && (common::CS_TYPE_BINARY == id_meta.cs_type_
+                             || common::CS_TYPE_UTF8MB4_BIN == id_meta.cs_type_);
       is_inited_ = true;
     }
   }
@@ -60,8 +82,11 @@ int ObSRMergeCmp::cmp(
     ret = OB_NOT_INIT;
   } else {
     int tmp_ret = 0;
-    if (OB_FAIL(cmp_func_(
-            get_id_datum(l.iter_idx_), get_id_datum(r.iter_idx_), tmp_ret, nullptr))) {
+    const ObDatum &l_id = get_id_datum(l.iter_idx_);
+    const ObDatum &r_id = get_id_datum(r.iter_idx_);
+    if (OB_LIKELY(fast_bin_string_) && OB_LIKELY(!l_id.is_null() && !r_id.is_null())) {
+      cmp_ret = bin_string_cmp(l_id, r_id);
+    } else if (OB_FAIL(cmp_func_(l_id, r_id, tmp_ret, nullptr))) {
     } else {
       cmp_ret = tmp_ret;
     }
@@ -276,9 +301,9 @@ int ObSRDaaTIterImpl::fill_merge_heap()
   int ret = OB_SUCCESS;
   ObSRMergeItem item;
   for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
-    const int64_t iter_idx = next_round_iter_idxes_[i];
+    const int64_t iter_idx = next_round_iter_idxes_.get_data()[i];
     ObISRDaaTDimIter *dim_iter = nullptr;
-    if (OB_ISNULL(dim_iter = dim_iters_->at(iter_idx))) {
+    if (OB_ISNULL(dim_iter = dim_iters_->get_data()[iter_idx])) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(dim_iter->get_next_row())) {
       if (OB_UNLIKELY(OB_ITER_END != ret)) {
@@ -287,8 +312,8 @@ int ObSRDaaTIterImpl::fill_merge_heap()
         ret = OB_SUCCESS;
       }
     } else if (OB_FAIL(dim_iter->get_curr_score(item.relevance_))) {
-    } else if (OB_NOT_NULL(iter_param_->dim_weights_) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * iter_param_->dim_weights_->at(iter_idx))) {
-    } else if (OB_FAIL(dim_iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
+    } else if (OB_NOT_NULL(iter_param_->dim_weights_) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * iter_param_->dim_weights_->get_data()[iter_idx])) {
+    } else if (OB_FAIL(dim_iter->get_curr_id(iter_domain_ids_.get_data()[iter_idx]))) {
     } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
     } else if (OB_FAIL(merge_heap_->push(item))) {
     } else {
@@ -325,12 +350,12 @@ int ObSRDaaTIterImpl::collect_dims_by_id(const ObDatum *&id_datum, double &relev
     } else if (FALSE_IT(iter_idx = top_item->iter_idx_)) {
     } else if (OB_FAIL(merge_heap_->pop())) {
     } else {
-      next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
+      next_round_iter_idxes_.get_data()[next_round_cnt_++] = iter_idx;
     }
   }
 
   if (OB_SUCC(ret)) {
-    id_datum = iter_domain_ids_[iter_idx];
+    id_datum = iter_domain_ids_.get_data()[iter_idx];
     if (OB_ISNULL(id_datum)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(relevance_collector_->get_result(relevance, got_valid_id))) {
@@ -396,8 +421,8 @@ int ObSRDaaTIterImpl::cache_result(int64_t &count, const ObDatum &id_datum, cons
   } else if (OB_UNLIKELY(count >= buffered_domain_ids_.count() || count >= buffered_relevances_.count())) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    buffered_domain_ids_[count].from_datum(id_datum);
-    buffered_relevances_[count] = relevance;
+    buffered_domain_ids_.get_data()[count].from_datum(id_datum);
+    buffered_relevances_.get_data()[count] = relevance;
     ++count;
     ++output_row_cnt_;
     if (limit_param->is_valid() && output_row_cnt_ >= limit) {
@@ -420,7 +445,7 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
     for (int64_t i = 0; i < count; ++i) {
       guard.set_batch_idx(i);
       ObDatum &id_proj_datum = id_proj_expr->locate_datum_for_write(*eval_ctx);
-      set_datum_func_(id_proj_datum, buffered_domain_ids_[i]);
+      set_datum_func_(id_proj_datum, buffered_domain_ids_.get_data()[i]);
       id_evaluated_flags.set(i);
       id_proj_expr->set_evaluated_projected(*eval_ctx);
     }
