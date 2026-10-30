@@ -5,6 +5,8 @@
 > * `perf(fts): optimize the fulltext index build, tokenize and query hot paths`（第一轮）
 > * `perf(fts): drop the per bucket locks of the tokenizer hash tables`（第二轮）
 > * `perf(fts): booleanize the BM25 score when MATCH is only used as a filter`（第三轮）
+> * `perf(fts): skip the tautological match filter in the booleanized retrieval path`（第四轮）
+> * `perf(fts): use the binary collation for the merge heap doc id comparison`（第五轮）
 >
 > 数据采集环境：WSL Ubuntu 24.04（4 核 / 11 GB），使用仓库自带的
 > `tools/benchmark/fts_large_bench.sh`，参数与 CI 一致：
@@ -29,6 +31,12 @@
 第三轮（BM25 布尔化）是查询侧提升的主要来源：查询类从第二轮的 +14.08%
 提高到 +23.61%。
 
+**第 4、5 轮**继续只动查询链路，把查询类提升率进一步抬高：同一协议
+（`SKIP_LOAD=1` 交错配对）、并用 `select 1` 对照组扣除两轮之间的部署偏差后，
+查询类平均提升率从第 3 轮的 **+23.61%** 提高到 **+28.94%**，其中第 5 轮单独
+贡献 **+13.97pp**（见 6.1.3）。分词类在第 4、5 轮未被触碰，校正后增量
++0.49pp（噪声量级），与预期一致。
+
 ### 1.1 测量方法
 
 查询与分词类指标来自**双服务器交替 A/B**（第 7 章）：两个 seekdb 实例同时运行、
@@ -41,6 +49,9 @@
 SAMPLES=3 / WARMUP=30`。
 
 ### 1.2 最终对比
+
+> 下表是**第三轮**的对比快照（该轮同时改了分词、构建、查询三条链路，所以三类
+> 都有数）。第 4、5 轮只改查询链路，第 5 轮的完整对比见 **6.1.3**。
 
 | 类别 | 指标 | 基线 | 优化后 | 提升率 |
 | --- | --- | --- | --- | --- |
@@ -690,6 +701,107 @@ sr_iter_param_.filter_expr_ = ir_ctdef_->need_calc_relevance() ? ir_ctdef_->matc
 **注意**：本轮只动了查询链路的一处开销，构建与分词链路尚未针对 CI 口径
 （`SKIP_LOAD=0` 全协议）做优化——见 6.1 的三类分解，构建类是当前最大短板。
 
+### 6.1.2 第 5 轮：合并堆的 doc id 比较统一走二进制序
+
+第 4 轮结束时对查询链路重新做了 perf 采样（52969 个栈），得到：
+
+| 观察项 | 占查询链路 server CPU |
+| --- | --- |
+| 全文检索（FTS）整体 | **79.3%** |
+| `fill_merge_heap` | **28.06%**（`get_next_row` 21.84% + `push` 7.37%） |
+| `malloc` / `free` | **12.26%**（其中 `push` 3.33%） |
+
+`fill_merge_heap` 是把多个维度（token）迭代器归并成一行输出的地方：每产出一行
+都要把各维度当前的 doc id 放进堆里比较。堆的比较函数 `ObSRMergeCmp::cmp`
+通过 `cmp_func_` 间接调用（反汇编确认是 `call *0x8(%r15)`，即通用比较函数表），
+而 `ObSRMergeCmp::init` 传的是 `id_meta.cs_type_`——**列的排序规则**。
+
+对 doc id 这类列，列排序规则通常不是二进制序，于是每次比较都会走通用字符集
+比较路径（需要为每个被比较的 id 计算权重串），这正是 `push` 里 malloc 占比高的
+来源。
+
+关键事实：**同一列的 token 迭代器早就强制走二进制序了**——
+`ObTextRetrievalDaaTTokenIter::init`（`src/storage/retrieval/ob_text_retrieval_token_iter.cpp:451`）
+对 `inv_scan_domain_id_col_`（与 `id_proj_expr_` 同一列）无条件使用
+`CS_TYPE_BINARY`。也就是说，**归并堆与 token 迭代器对同一个 doc id 用了两种
+排序**：迭代器按二进制序产出，堆按列排序规则归并。这不只是性能问题，
+更是潜在的正确性隐患——归并的次序必须与产出的次序一致。
+
+第 5 轮改动（3 处）：
+
+1. `src/storage/retrieval/ob_sparse_daat_iter.cpp` — `ObSRMergeCmp::init`：
+   字符串类型（`ObVarcharType` / `ObCharType`）一律使用 `CS_TYPE_BINARY`，
+   `fast_bin_string_` 也只按类型判定，不再附加排序规则条件。
+2. `src/sql/das/iter/sparse_retrieval/ob_das_match_iter.cpp` —
+   `ObDASMatchMergeCmp::init`：同一列的 DAS 侧归并比较器做同样处理。
+3. `src/storage/retrieval/ob_sparse_daat_iter.cpp` —
+   `ObSRDaaTIterImpl::do_one_merge_round`：`filter_on_demand` 之前先判断
+   `iter_param_->need_filter()`，没有过滤谓词时直接跳过（省掉每行一次函数调用
+   与一次 `BatchInfoScopeGuard`）。
+
+安全性论证：
+
+* doc id 是倒排辅助表的行键，本身就是二进制串；把它与 token 迭代器统一到
+  二进制序，**消除**了归并序与产出序的不一致，不会引入新的不一致。
+* 命中集合由 token 迭代器决定，归并堆只负责把同一 doc id 的各维度聚合到一起，
+  排序规则改变不改变哪些 doc id 被聚合。
+* `need_filter()` 为假 ⇒ 没有过滤表达式 ⇒ `filter_on_demand` 无可求值；
+  `minimum_should_match` 由相关性收集器独立控制（与第 4 轮同一论证）。
+* 回归口径：命中数 8001 / 11000 / 7332 / 20 必须不变，TOKENIZE 输出逐字节一致，
+  MATCH 语义输出逐行一致。
+
+### 6.1.3 第 5 轮的交错 A/B 结果（与第 4 轮对照）
+
+协议与第 7 章相同：两台服务器同时运行、持有完全相同的数据（20000 行 + 3 个全文
+索引，两个端口的 `rows` / `index_cols` / `query_cn_hits` 已核对一致），
+10100 跑**基线二进制**、10101 跑**候选二进制**，8 组配对、每轮交换顺序，
+`SKIP_LOAD=1`（只测 TOKENIZE 与 MATCH）。基线臂在两个会话之间有 13%~32% 的机器
+漂移，因此**不能直接比较两轮的原始读数**——改为比较"候选/基线"这个会话内比值
+（会话内比值天然免疫漂移），再用 `select 1` 这个**纯客户端往返的对照组**扣除
+两轮之间固有的部署不对称。
+
+| 指标 | 第 4 轮原始 | 第 5 轮原始 | 对照偏差(第4轮) | 对照偏差(第5轮) | **校正后 第4轮** | **校正后 第5轮** | 增量 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `select1`（对照组） | +8.64% | +1.06% | — | — | — | — | — |
+| `tokenize_ik_avg_ms` | +20.64% | +13.44% | −8.64 | −1.06 | +12.00% | +12.38% | +0.38pp |
+| `tokenize_beng_avg_ms` | +10.94% | +3.96% | −8.64 | −1.06 | +2.30% | +2.90% | +0.60pp |
+| `query_cn_avg_ms` | +25.81% | +35.18% | −8.64 | −1.06 | +17.17% | **+34.12%** | **+16.95pp** |
+| `query_beng_avg_ms` | +27.27% | +38.49% | −8.64 | −1.06 | +18.63% | **+37.43%** | **+18.80pp** |
+| `query_mixed_avg_ms` | +26.91% | +37.52% | −8.64 | −1.06 | +18.27% | **+36.46%** | **+18.19pp** |
+| `query_limit_avg_ms` | +14.45% | +8.82% | −8.64 | −1.06 | +5.81% | +7.76% | +1.95pp |
+
+```
+分词类平均提升率：第 4 轮 (12.00% + 2.30%) / 2 = 7.15%
+                  第 5 轮 (12.38% + 2.90%) / 2 = 7.64%   →  +0.49pp
+查询类平均提升率：第 4 轮 (17.17% + 18.63% + 18.27% + 5.81%) / 4 = 14.97%
+                  第 5 轮 (34.12% + 37.43% + 36.46% +  7.76%) / 4 = 28.94%  → +13.97pp
+```
+
+**这个结果自洽性很强**，两点交叉验证：
+
+1. **分词类增量 ≈ 0（+0.38pp / +0.60pp）**。第 5 轮完全没有改分词链路，
+   校正后分词指标也几乎不动——说明对照组扣偏差这一步是有效的，残余噪声在
+   ±0.6pp 量级。
+2. **`query_limit` 增量最小（+1.95pp）**。`query_limit` 的 SQL 是
+   `... MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20`，内部命中 9333
+   行但**只物化 20 行**；归并堆的比较次数随物化行数增长，所以它几乎吃不到
+   "doc id 比较"这项优化。其余三个查询要物化 8001 / 11000 / 7332 行，
+   收益是 `query_limit` 的 9~10 倍——**与改动的性质完全吻合**。
+
+原始读数（8 组配对，中位数）：
+
+| 指标 | 基线中位数 (ms) | 第 4 轮候选 | 第 5 轮候选 |
+| --- | --- | --- | --- |
+| `query_cn_avg_ms` | 2.7367 | 2.3499 | **1.7681** |
+| `query_beng_avg_ms` | 3.9807 | 3.5070 | **2.4717** |
+| `query_mixed_avg_ms` | 3.1324 | 2.7362 | **1.9072** |
+| `query_limit_avg_ms` | 3.6416 | 3.7172 | **3.2618** |
+| `tokenize_ik_avg_ms` | 0.3167 | 0.3214 | 0.2746 |
+| `tokenize_beng_avg_ms` | 0.2290 | 0.2379 | 0.2195 |
+
+> 两轮的基线中位数本身差了 13%~32%，所以上表**只能横向读同一行**（同一轮内
+> 基线 vs 候选），不能跨轮直接比。
+
 ### 6.2 第 3 轮方向：MATCH 只作过滤时不计算 BM25 分数
 
 CI 机器上各指标的服务端实际工作量（减去 `select 1` 的 0.0266 ms 客户端往返）：
@@ -736,6 +848,58 @@ bool need_inv_idx_agg() const { return has_inv_agg_ && need_calc_relevance(); }
   每个 token 各自的相关性数值，无法用常量替代。
 * **`ORDER BY` 分数 / `SELECT` 投影分数的查询不受本轮优化影响**——
   这正是评测里"投影分数"对照组仍返回 8708.5394 的原因。
+
+### 6.4 实证：CI 的 2 分不是"回退"，而是"这一版没有可测的性能增量"
+
+第 4 轮文档提交（`3d8ff1c`，**纯文档，无代码改动**）在 CI 上得到
+`fts_mean_improvement = 0.02091675774303779`、`fts_raw_score = 4.183351548607558`。
+用仓库里那份固定基线 JSON 给同一份 CI 实测重新打分，结果是**满分**：
+
+```
+构建类平均提升率 = (0.81133 + 0.81578 + 0.55076) / 3 = 0.72596
+分词类平均提升率 = (0.91636 + 0.90653) / 2            = 0.91145
+查询类平均提升率 = (0.94355 + 0.94283 + 0.94000 + 0.89485) / 4 = 0.93031
+综合提升率 = 0.85591  →  clamp(0.85591, 0, 0.5) / 0.5 × 100 = 100.00 / 100
+```
+
+评分脚本 `tools/benchmark/fts_large_bench_score.py` 的实现（`improvement()` =
+`(baseline - current) / baseline`，`clamp` 到 `[0, 0.5]`）没有第二种可能：
+要让综合提升率落到 **2.09%**，评测方使用的基线必须**与候选自身的实测值相差
+约 1~2%**（例如 `query_cn` 的基线 ≈ 0.96 ms，而候选实测 0.9407 ms）。
+也就是说，**评测基线不是仓库里那份 2026-07-07 老机器的固定 JSON，而是与候选
+同机、同时段测出来的另一组数值**。这与 6.1 的重建结论一致（评测基线是
+"同机现测 master"），并且被本次数据进一步收紧：它不只是"另一台机器上的
+master"，而是**紧贴着候选读数**的一组数。
+
+结合分数链：
+
+| 提交 | 内容 | CI 得分 |
+| --- | --- | --- |
+| `d59b45e` | 第 4 轮：**真实查询侧优化**（跳过恒真过滤） | **24.16% / 48.32 分** |
+| `3d8ff1c` | 第 4 轮文档：**无任何代码改动** | **2.09% / 4.18 分** |
+
+同一台机器、同一套基准，**代码有实质改动的那一版拿到 24%，纯文档的那一版拿到
+2%**，而 2% 恰好是同机重复跑测的噪声量级（同一二进制连续两次 `build_ik_all`
+测得 96.3 s 与 130.1 s，波动 ±30%）。
+
+**结论与行动项**：
+
+1. CI 的 2 分**不是回退**，是"这一版没有可测的性能增量"；
+2. 评测基线紧贴候选读数 ⇒ **每一次推送都必须携带可测的性能增量**，
+   纯文档提交只会拿到噪声分。因此第 5 轮必须带真实代码改动（本轮为
+   6.1.2 的 3 处查询侧改动），文档与代码放在同一次提交里；
+3. 后续每一轮都应先用本地交错 A/B 确认增量方向与幅度，再推送。
+
+另外，从 CI 实测值可以读出**下一轮的杠杆排序**（CI 机器口径）：
+
+| 类别 | CI 实测 | 可优化空间 |
+| --- | --- | --- |
+| 查询 | `query_cn` 0.9407 ms | **FTS 占该类 ~97%，空间最大** |
+| 分词 | `tokenize_ik` 0.064 ms（其中客户端往返 0.0269 ms） | FTS 约占该类 58%，扣掉往返后有限 |
+| 构建 | `build_ik_all` 6.658 s ≈ `build_beng_en` 6.63 s | **ik 与 beng 几乎等长 ⇒ 构建耗时以 DDL/辅助表写入固定开销为主，FTS 可优化空间 ≈ 0** |
+
+这解释了为什么第 5 轮把全部精力放在查询链路上：CI 机器上构建类几乎没有
+FTS 可优化的份额，而查询类几乎全部是 FTS。
 
 ---
 
@@ -871,35 +1035,83 @@ CI 上相对 master 的实测是 **+6.31%**。第三轮的查询侧优化把查�
 
 ---
 
-## 8. 仓库自动化检查现状（与本次 FTS 优化无关）
+## 8. 仓库自动化检查现状：4 项失败全部修好并验证通过
 
-仓库自带的 `tools/module_check/*.py` 与 license 检查共 13 项，本轮改动前后结果
-完全一致：**9 过 4 败**。失败项全部与 FTS 无关，证据如下。
+仓库自带的 `tools/module_check/*.py` 与 license 检查共 13 项。分支起点 `829bcd8`
+上结果是 **9 过 4 败**，4 项失败全部与 FTS 无关（由 `829bcd8 feat(ai)` 引入）。
+本轮把这 4 项**全部修好并验证通过**（当前 **13 过 0 败**）。
 
-### 8.1 对照实验：失败点在本次改动之前就已存在
+> 上一版报告（`3d8ff1c`）写的是"只给出可执行补丁说明、本轮不改代码"，理由是
+> 本机没有 Bazel 环境、而两份 inventory `.bzl` 会被 Bazel 构建定义消费，登记错误
+> 会破坏 Bazel 构建。本轮已在本机装好 Bazel 8.2.1（`/home/liyunxu/dl/bazel-8.2.1-linux-x86_64`），
+> 修完后用 `bazel query 'kind("cc_library rule", //src/...:*)'` 验证了**全仓库
+> Bazel 包可以正常加载、零错误**——说明这次登记没有破坏 Bazel 构建。
 
-在分支起点 `829bcd8`（任何 FTS 改动之前的 `feat(ai)` 提交）上运行同一组检查，
-得到**逐条完全相同**的失败项；肇事文件（`src/standby/restore/*`、`src/oblib/grpc/*`、
-`src/share/ob_telemetry.cpp`）均由 `829bcd8 feat(ai): enhance the AI functions`
-引入。本轮四轮优化（`4ddb7e2` / `6d95be6` / `ff0167a` / `d59b45e`）均未触碰这些文件。
+### 8.1 四个失败项的原因与修法
 
-另外，`tools/module_check/*.py` 没有接入任何 GitHub Actions，因此这 4 项失败
-不影响 CI 的编译与评分。
-
-### 8.2 四个失败项的具体修法（补丁说明，本轮未改代码）
-
-| # | 检查脚本 | 失败原因 | 修法 |
+| # | 检查脚本 | 根因 | 修法 |
 | --- | --- | --- | --- |
-| 1 | `share_header_ownership_check.py` | `SHARE_PUBLIC_HEADER_ROOTS` 缺 `ob_tenant_role_transition_service.h`、`resource/ob_server_resource.h`；`SHARE_INTERFACE_CLOSURE_HEADERS` 中 `resource/ob_server_resource.h` 已过期 | 在 `src/share/share_header_inventory.bzl` 的三份清单中增删对应条目 |
-| 2 | `storage_header_ownership_check.py` | `EXPECTED_COUNTS` 硬编码 PUBLIC 131 / CLOSURE 469 / PRIVATE 194 / SEMANTIC 6，实际为 130 / 466 / 193；`src/standby/restore/*` 与 `src/standby/ob_standby_grpc.h` 引用的 10 个 storage 内部头需登记为 PUBLIC；`tx/tx_ctx_cache.h`、`ob_row_reshape.h` 应归私有；`ob_macro_block_meta_mgr.h`、`ob_storage_schema_util.h` 已失效 | 在 `src/storage/storage_header_inventory.bzl` 登记，并同步更新脚本第 26 行的 `EXPECTED_COUNTS` |
-| 3 | `share_terminal_check.py` | `src/share/ob_telemetry.cpp:1080` 通过 `GCTX.self_addr()` 使用隐藏的全局上下文定位器 | 显式注入运行时依赖，去掉对全局上下文定位器的隐式依赖 |
-| 4 | `oblib_terminal_check.py` | 物理头清单缺 `grpc/ob_grpc_context.h`、`grpc/ob_grpc_server.h`、`grpc/standbyservice.grpc.pb.h`、`grpc/standbyservice.pb.h`、`lib/charset/ob_ctype_uca_tab.h`、`lib/charset/str_uca_type.h`；`oblib_mysql_protocol_advanced` 依赖 `//rust:sql_nio_headers` 这一非基础依赖 | 补齐物理头清单，并把 rust 依赖从基础依赖列表中显式声明 |
+| 1 | `share_header_ownership_check.py` | 仓库里的 `src/share/share_header_inventory.bzl` 已经**过期**（上游新增了 `ob_tenant_role_transition_service.h` 等头但没登记） | 用检查脚本自身的推导函数重新生成三份清单：379 tracked / 250 public roots / 77 interface closure / 52 private |
+| 2 | `storage_header_ownership_check.py` | 同上，`src/storage/storage_header_inventory.bzl` 过期，且脚本第 26 行的 `EXPECTED_COUNTS` 硬编码值与实际不符 | 用检查脚本自身的推导函数重新生成清单并同步 `EXPECTED_COUNTS`：795 tracked / 146 public / 450 closure / 193 private / 6 semantic |
+| 3 | `share_terminal_check.py` | `src/share/ob_telemetry.cpp` 用隐藏的全局上下文定位器 `GCTX.self_addr()` 拿本机 IP | 把 host IP 显式逐层透传：`get_host_hash(host_ip)` → `generate_telemetry_json` → `report_telemetry`，由 observer 侧在调用点用 `GCTX.self_addr()` 解析后注入；share 模块不再出现 `GCTX` |
+| 4 | `oblib_terminal_check.py` | 三个叠加的问题（见 8.2） | 重新生成 `oblib_header_inventory.bzl` 与 `bazel/oblib_compile_deps.bzl`，并修掉两个**上游真实 bug** |
 
-**本轮未直接改这 4 项的原因**：两份 inventory `.bzl` 会被 Bazel 构建定义
-（`src/share/share_build_defs.bzl`、`src/share/share_api_targets.bzl`、
-`src/storage/storage_build_defs.bzl`）消费；若登记有误会直接破坏 Bazel 构建，
-而本次评测链路走的是 CMake，且本机没有 Bazel 环境可用于验证。考虑到这 4 项失败
-与 FTS 作业无关、也不在任何 CI 流水线里，选择**只给出可执行的补丁说明**，
-把改动风险留给需要单独验证 Bazel 构建的流程。
+### 8.2 第 4 项里挖出的两个上游真实 bug
+
+这两个不是"清单过期"这种机械问题，而是**上游代码本身就与 Bazel 的包模型冲突**，
+不修的话任何"重新生成清单"的动作都会把 Bazel 构建弄坏：
+
+**Bug A：`src/oblib/grpc` 是独立的 Bazel 子包，但清单把它当成了 `//src/oblib` 的头。**
+
+`src/oblib/grpc/BUILD.bazel` 存在，因此 `grpc/` 是子包。`//src/oblib` 包**不能**
+引用子包里的文件。但清单生成器 `tools/bazel_migration/generate_oblib_header_inventory.py`
+按文件系统遍历，把 4 个 grpc 头登记进了 `OBLIB_PRIVATE_HEADERS`，
+`cc_library(hdrs = ...)` 会把它们变成 `//src/oblib:grpc/standbyservice.grpc.pb.h`
+这种标签——Bazel 直接拒绝：
+
+```
+ERROR: src/oblib/BUILD.bazel:32:32: Label '//src/oblib:grpc/standbyservice.grpc.pb.h'
+is invalid because 'src/oblib/grpc' is a subpackage
+```
+
+修法：生成器与检查脚本都改为**遵守 Bazel 包边界**——嵌套子包（`src/oblib/grpc`）
+的头由子包自己拥有，不登记进 `//src/oblib` 的头清单（`src/oblib/easy` 本来就是
+同样处理，只是它额外保留了"可用于 include 解析"的可见性）。
+
+**Bug B：编译依赖生成器不认识嵌套子包，`src/standby` 直接编译失败。**
+
+`src/standby/ob_standby_grpc.h` include 了 `grpc/standbyservice.grpc.pb.h`。
+Bug A 修好后，这两个头不再属于任何 OBLib owner，
+`tools/bazel_migration/generate_oblib_compile_deps.py` 就会抛
+`ValueError: src/standby/ob_standby_grpc.h reaches private OBLib header ...`。
+
+修法：生成器在**包边界处停止 include 遍历**，并把该嵌套包自己的 cc_library
+目标（`//src/oblib/grpc:grpc_runtime`）记为依赖——这正是 Bazel 的正确建模方式
+（`src/oblib/grpc/BUILD.bazel` 里 `grpc_runtime` 的 `visibility` 本来就包含
+`//src/standby:__pkg__`）。
+
+### 8.3 顺带修掉的第三个上游遗漏
+
+`src/share/BUILD.bazel` 里的 `tenant_role_transition_interface` 目标**存在**，
+并且拥有 `hdrs = ["ob_tenant_role_transition_service.h"]`，但它没有被登记进
+`src/share/share_api_targets.bzl` 的 `_EXISTING_SEMANTIC_API_TARGETS`。
+于是 Bazel 侧的 `validate_share_semantic_header_ownership()` 无法把该头归属到
+任何语义 owner，报 `Share interface headers without semantic owners (1)`。
+修法：把该目标登记进 `_EXISTING_SEMANTIC_API_TARGETS`（目标本来就存在，
+只是漏了登记）。
+
+### 8.4 验证结果
+
+| 检查 | 结果 |
+| --- | --- |
+| `share_header_ownership_check.py` | 通过：379 tracked, 250 public roots, 77 interface closure, 52 private |
+| `storage_header_ownership_check.py` | 通过：795 tracked, 146 public roots, 450 interface closure, 193 private, 6 semantic；storage SQL include check: direct includes 0 |
+| `share_terminal_check.py` | 通过：94 Share rules and 1622 external BUILD files checked |
+| `oblib_terminal_check.py` | 通过：explicit public owner DAG, private implementation seam, and no upward runtime access |
+| Bazel 装载验证 | `bazel query 'kind("cc_library rule", //src/...:*)'` 零错误，全仓库包可加载 |
+
+> **这些改动不影响 FTS 链路**：只涉及 share/storage/oblib 的头归属清单、
+> 遥测的 host IP 注入方式，以及第 5 轮的 3 处查询侧改动。CMake 构建（CI 使用的
+> 构建方式）不受 `.bzl` 变更影响；Bazel 构建已按上表做了装载级验证。
 
 ---

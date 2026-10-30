@@ -56,16 +56,28 @@ int ObSRMergeCmp::init(
     ret = OB_ERR_UNEXPECTED;
   } else {
     iter_ids_ = iter_ids;
-    common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, id_meta.cs_type_);
+    // The doc id is the row key of the inverted index table, i.e. a binary
+    // string, and the dimension iterators that produce the ids compare them
+    // with the binary collation as well (see
+    // ObTextRetrievalDaaTTokenIter::init).  The merge heap has to use the
+    // same order, otherwise it would merge the streams in a different order
+    // than the order in which they were produced.
+    //
+    // Using the column collation here would dispatch through the generic
+    // charset comparison for every compared id, which computes a weight
+    // string per comparison.  The merge heap compares the ids of every
+    // output row, so that dominates the merge.
+    const bool is_string_type = (common::ObVarcharType == id_meta.type_
+                                 || common::ObCharType == id_meta.type_);
+    const common::ObCollationType cmp_cs_type = is_string_type ? common::CS_TYPE_BINARY : id_meta.cs_type_;
+    common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, cmp_cs_type);
     cmp_func_ = basic_funcs->null_first_cmp_;
     if (OB_ISNULL(cmp_func_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
       // The doc id column is a binary string, so the comparison is a plain
       // memcmp plus the length difference.
-      fast_bin_string_ = (common::ObVarcharType == id_meta.type_ || common::ObCharType == id_meta.type_)
-                         && (common::CS_TYPE_BINARY == id_meta.cs_type_
-                             || common::CS_TYPE_UTF8MB4_BIN == id_meta.cs_type_);
+      fast_bin_string_ = is_string_type;
       is_inited_ = true;
     }
   }
@@ -288,7 +300,10 @@ int ObSRDaaTIterImpl::do_one_merge_round(int64_t &count)
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
     }
   } else if (OB_FAIL(collect_dims_by_id(id_datum, relevance, need_project))) {
-  } else if (need_project && OB_FAIL(filter_on_demand(count, relevance, need_project))) {
+  } else if (need_project && iter_param_->need_filter()
+             && OB_FAIL(filter_on_demand(count, relevance, need_project))) {
+    // Without a filter expression there is nothing to evaluate, so the call
+    // is skipped instead of entering the filter branch for every output row.
   } else if (need_project && OB_FAIL(cache_result(count, *id_datum, relevance))) {
     if (OB_ITER_END != ret) {
     }

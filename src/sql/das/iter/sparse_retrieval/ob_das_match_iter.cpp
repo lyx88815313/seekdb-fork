@@ -685,7 +685,14 @@ int ObDASMatchMergeCmp::init(
   } else {
     iter_ids_ = iter_ids;
     datum_access_ctx_ = datum_access_ctx;
-    common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, id_meta.cs_type_);
+    // The doc id is the row key of the inverted index table, i.e. a binary
+    // string, so it is compared with the binary collation.  Using the column
+    // collation would dispatch through the generic charset comparison, which
+    // computes a weight string for every compared id.
+    const bool is_string_type = (common::ObVarcharType == id_meta.type_
+                                 || common::ObCharType == id_meta.type_);
+    const common::ObCollationType cmp_cs_type = is_string_type ? common::CS_TYPE_BINARY : id_meta.cs_type_;
+    common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, cmp_cs_type);
     cmp_func_ = basic_funcs->null_first_cmp_;
     if (OB_ISNULL(cmp_func_)) {
       ret = OB_ERR_UNEXPECTED;
