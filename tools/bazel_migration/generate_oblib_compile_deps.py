@@ -233,8 +233,53 @@ def _component_closures(graph, direct_owners):
     return component_by_path, cache
 
 
+def _nested_oblib_packages(repo):
+    """Return the nested Bazel packages under OBLib, keyed by their directory.
+
+    A nested package owns its headers itself, so the include walk must stop at
+    that package boundary and depend on the nested package's own target
+    instead of an OBLib header owner.
+    """
+    oblib = repo / "src" / "oblib"
+    packages = {}
+    for pattern in ("BUILD", "BUILD.bazel"):
+        for build_file in oblib.rglob(pattern):
+            directory = build_file.parent
+            if directory == oblib or directory == oblib / "easy":
+                continue
+            packages[directory.relative_to(oblib).as_posix()] = directory
+    return packages
+
+
+def _nested_package_targets(repo, packages):
+    """Map a nested package header to the cc_library target that owns it."""
+    owners = {}
+    for relative, directory in sorted(packages.items()):
+        package = "src/oblib/" + relative
+        rules = _query_xml(repo, 'kind("cc_library rule", //%s:*)' % package)
+        for rule in rules.findall("rule"):
+            # Bazel reports the fully qualified target label here.
+            label = rule.attrib["name"]
+            for header in _list_labels(rule, "hdrs"):
+                _, _, name = header.rpartition(":")
+                owners[(package, name)] = label
+    return owners
+
+
+def _nested_package_owner(header, packages, nested_owners):
+    """Return the nested package target that owns an OBLib nested header."""
+    for relative in packages:
+        prefix = relative + "/"
+        if header.startswith(prefix):
+            package = "src/oblib/" + relative
+            return nested_owners.get((package, header[len(prefix):]))
+    return None
+
+
 def _build_registry(repo):
     owners = _load_owners(repo)
+    nested_packages = _nested_oblib_packages(repo)
+    nested_owners = _nested_package_targets(repo, nested_packages)
     generated_unity_members = _generated_unity_members(repo)
     cc_rules = _query_xml(
         repo,
@@ -286,10 +331,18 @@ def _build_registry(repo):
             if header is not None:
                 owner = owners.get(header)
                 if owner is None:
-                    raise ValueError(
-                        "%s reaches private OBLib header %s"
-                        % (path, header)
+                    nested = _nested_package_owner(
+                        header, nested_packages, nested_owners
                     )
+                    if nested is None:
+                        raise ValueError(
+                            "%s reaches private OBLib header %s"
+                            % (path, header)
+                        )
+                    # The nested package owns its headers, so the walk stops at
+                    # the package boundary and the nested target is used.
+                    path_owners.add(nested)
+                    continue
                 path_owners.add(owner)
             else:
                 dependencies.add(dependency)

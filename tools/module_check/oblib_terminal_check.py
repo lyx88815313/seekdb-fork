@@ -82,6 +82,28 @@ def _load_inventory(repo):
     return namespace
 
 
+def _nested_bazel_packages(oblib):
+    """Return the nested Bazel packages that live under OBLib.
+
+    A nested package owns its own headers, so those headers are not part of
+    the //src/oblib package and must not be registered in OBLib's header
+    inventory.  src/oblib/easy is excluded because it is handled separately:
+    its headers stay visible for include resolution but never become owners.
+    """
+    packages = set()
+    for pattern in ("BUILD", "BUILD.bazel"):
+        for build_file in oblib.rglob(pattern):
+            directory = build_file.parent
+            if directory == oblib or directory == oblib / "easy":
+                continue
+            packages.add(directory)
+    return packages
+
+
+def _owned_by_nested_package(path, packages):
+    return any(parent in packages for parent in path.parents)
+
+
 def _check_inventory(repo, errors):
     for generator_name in (
         "generate_oblib_header_inventory.py",
@@ -105,10 +127,12 @@ def _check_inventory(repo, errors):
     owner_by_header = inventory["OBLIB_HEADER_TARGET_FOR_HEADER"]
     private_headers = set(inventory["OBLIB_PRIVATE_HEADERS"])
     oblib = repo / "src" / "oblib"
+    nested_packages = _nested_bazel_packages(oblib)
     physical_headers = {
         path.relative_to(oblib).as_posix()
         for path in _walk_files(oblib, HEADER_SUFFIXES)
         if not path.relative_to(oblib).as_posix().startswith("easy/")
+        and not _owned_by_nested_package(path, nested_packages)
     }
 
     declared_public = []

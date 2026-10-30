@@ -78,6 +78,7 @@ _EXISTING_SEMANTIC_API_TARGETS = [
     "tablet_replica_types",
     "task_control",
     "tenant_module_init",
+    "tenant_role_transition_interface",
     "tenant_runtime",
     "text_analysis",
     "thread_pool_interface",

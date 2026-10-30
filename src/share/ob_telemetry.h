@@ -46,7 +46,10 @@ int generate_telemetry_uuid(const char *machine_id,
                             char *uuid,
                             const int64_t uuid_len);
 
-int report_telemetry(const char *reporter, const char *event_name);
+// The host address is injected by the caller. The share module must not look
+// it up in the global runtime context, so the caller resolves it and passes
+// the textual address. An empty address is reported as an error.
+int report_telemetry(const char *reporter, const char *event_name, const char *host_ip);
 
 } // namespace share
 } // namespace oceanbase

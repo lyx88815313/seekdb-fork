@@ -143,7 +143,14 @@ int TelemetryTask::report()
 {
   const char *env_reporter = std::getenv("REPORTER");
   const char *reporter = env_reporter ? env_reporter : (GCTX.is_embedded_mode() ? "embed" : "server");
-  return share::report_telemetry(reporter, "bootstraped");
+  // The share module must not reach into the global runtime context, so the
+  // host address is resolved here and injected.
+  char ip_buf[MAX_IP_ADDR_LENGTH] = {'\0'};
+  const ObAddr &self_addr = GCTX.self_addr();
+  if (!self_addr.ip_to_string(ip_buf, sizeof(ip_buf))) {
+    ip_buf[0] = '\0';
+  }
+  return share::report_telemetry(reporter, "bootstraped", ip_buf);
 }
 
 //////////////////////////////////////
