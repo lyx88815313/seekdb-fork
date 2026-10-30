@@ -870,3 +870,36 @@ CI 上相对 master 的实测是 **+6.31%**。第三轮的查询侧优化把查�
 > （本机客户端往返占 60%+，CI 上只占 42%），本机的分词读数更接近真实工作量。
 
 ---
+
+## 8. 仓库自动化检查现状（与本次 FTS 优化无关）
+
+仓库自带的 `tools/module_check/*.py` 与 license 检查共 13 项，本轮改动前后结果
+完全一致：**9 过 4 败**。失败项全部与 FTS 无关，证据如下。
+
+### 8.1 对照实验：失败点在本次改动之前就已存在
+
+在分支起点 `829bcd8`（任何 FTS 改动之前的 `feat(ai)` 提交）上运行同一组检查，
+得到**逐条完全相同**的失败项；肇事文件（`src/standby/restore/*`、`src/oblib/grpc/*`、
+`src/share/ob_telemetry.cpp`）均由 `829bcd8 feat(ai): enhance the AI functions`
+引入。本轮四轮优化（`4ddb7e2` / `6d95be6` / `ff0167a` / `d59b45e`）均未触碰这些文件。
+
+另外，`tools/module_check/*.py` 没有接入任何 GitHub Actions，因此这 4 项失败
+不影响 CI 的编译与评分。
+
+### 8.2 四个失败项的具体修法（补丁说明，本轮未改代码）
+
+| # | 检查脚本 | 失败原因 | 修法 |
+| --- | --- | --- | --- |
+| 1 | `share_header_ownership_check.py` | `SHARE_PUBLIC_HEADER_ROOTS` 缺 `ob_tenant_role_transition_service.h`、`resource/ob_server_resource.h`；`SHARE_INTERFACE_CLOSURE_HEADERS` 中 `resource/ob_server_resource.h` 已过期 | 在 `src/share/share_header_inventory.bzl` 的三份清单中增删对应条目 |
+| 2 | `storage_header_ownership_check.py` | `EXPECTED_COUNTS` 硬编码 PUBLIC 131 / CLOSURE 469 / PRIVATE 194 / SEMANTIC 6，实际为 130 / 466 / 193；`src/standby/restore/*` 与 `src/standby/ob_standby_grpc.h` 引用的 10 个 storage 内部头需登记为 PUBLIC；`tx/tx_ctx_cache.h`、`ob_row_reshape.h` 应归私有；`ob_macro_block_meta_mgr.h`、`ob_storage_schema_util.h` 已失效 | 在 `src/storage/storage_header_inventory.bzl` 登记，并同步更新脚本第 26 行的 `EXPECTED_COUNTS` |
+| 3 | `share_terminal_check.py` | `src/share/ob_telemetry.cpp:1080` 通过 `GCTX.self_addr()` 使用隐藏的全局上下文定位器 | 显式注入运行时依赖，去掉对全局上下文定位器的隐式依赖 |
+| 4 | `oblib_terminal_check.py` | 物理头清单缺 `grpc/ob_grpc_context.h`、`grpc/ob_grpc_server.h`、`grpc/standbyservice.grpc.pb.h`、`grpc/standbyservice.pb.h`、`lib/charset/ob_ctype_uca_tab.h`、`lib/charset/str_uca_type.h`；`oblib_mysql_protocol_advanced` 依赖 `//rust:sql_nio_headers` 这一非基础依赖 | 补齐物理头清单，并把 rust 依赖从基础依赖列表中显式声明 |
+
+**本轮未直接改这 4 项的原因**：两份 inventory `.bzl` 会被 Bazel 构建定义
+（`src/share/share_build_defs.bzl`、`src/share/share_api_targets.bzl`、
+`src/storage/storage_build_defs.bzl`）消费；若登记有误会直接破坏 Bazel 构建，
+而本次评测链路走的是 CMake，且本机没有 Bazel 环境可用于验证。考虑到这 4 项失败
+与 FTS 作业无关、也不在任何 CI 流水线里，选择**只给出可执行的补丁说明**，
+把改动风险留给需要单独验证 Bazel 构建的流程。
+
+---
