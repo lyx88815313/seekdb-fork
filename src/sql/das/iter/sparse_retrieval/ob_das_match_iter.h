@@ -99,6 +99,12 @@ private:
   const ObFixedArray<ObDocIdExt, ObIAllocator> *iter_ids_;
   const common::ObDatumAccessContext *datum_access_ctx_;
   bool is_inited_;
+  // The doc id is the row key of the inverted index table, i.e. a binary
+  // string.  The generic datum comparison dispatches it through the charset
+  // layer, which computes a weight string for every comparison.  The merge
+  // heap compares the doc ids of every output row, so the comparison is done
+  // directly when the doc id uses the binary collation.
+  bool fast_bin_string_;
 };
 
 typedef common::ObLoserTree<ObDASMatchMergeItem, ObDASMatchMergeCmp>

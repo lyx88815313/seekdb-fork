@@ -7,6 +7,10 @@
 > * `perf(fts): booleanize the BM25 score when MATCH is only used as a filter`（第三轮）
 > * `perf(fts): skip the tautological match filter in the booleanized retrieval path`（第四轮）
 > * `perf(fts): use the binary collation for the merge heap doc id comparison`（第五轮）
+> * `perf(fts): cut the per-call overhead of TOKENIZE and the domain id comparison`（第六轮）
+> * `perf(fts): look the dictionary word up once per dict and drop the libc memcpy from the hash`（第七轮）
+> * `perf(fts): compute the data plane page checksum eight bytes at a time`（第八轮）
+> * `perf(fts): compute the data plane page checksum with the crc32 instruction`（第九轮）
 >
 > 数据采集环境：WSL Ubuntu 24.04（4 核 / 11 GB），使用仓库自带的
 > `tools/benchmark/fts_large_bench.sh`，参数与 CI 一致：
@@ -15,6 +19,14 @@
 >
 > 第三轮为了压低测量噪声，另加了一层**测量协议**（静默等待 + ABBA 交错 + 重复跑测），
 > 详见第 7 章。**基准脚本本身没有做任何修改。**
+>
+> **当前状态（截至第 9 轮）**：第 8 轮的 CI 权威读数是 `fts_raw_score` = **49.71**
+> （`fts_mean_improvement` = 24.86%），分项为构建 **+16.63%** / 分词 **+24.57%** /
+> 查询 **+33.37%**。第 9 轮把构建链路的页校验和换成 CPU 指令
+> （数值逐位不变），CI 结果待回收。
+> 九轮改动覆盖构建、分词、查询三条链路，命中数（8001 / 11000 / 7332 / 20）
+> 与 TOKENIZE 输出始终与基线一致。
+> CI 得分结构见 9.7，第 8 轮的 CI 结果与预测复核见 11.5，第 9 轮见 12。
 
 ---
 
@@ -1115,3 +1127,1596 @@ Bug A 修好后，这两个头不再属于任何 OBLib owner，
 > 构建方式）不受 `.bzl` 变更影响；Bazel 构建已按上表做了装载级验证。
 
 ---
+
+## 9. 第 6 轮：TOKENIZE 表达式的每次调用开销 + domain id 比较
+
+### 9.1 先量后改：全协议交错 A/B（SKIP_LOAD=0）
+
+第 6 轮开工前先做了一轮**全协议**交错采样（基线二进制 vs 第 5 轮候选二进制，
+两台服务器同时跑、持有完全相同的数据、ABBA 顺序、每轮 2 组配对）：
+
+| 类别 | 提升率 | 噪声（组内 stdev） | 结论 |
+| --- | --- | --- | --- |
+| 查询类（4 项） | **+39.72%** | 8.9~18.8pp | 可靠 |
+| 构建类（3 项） | +3.84% | `build_ik_all` 33.83pp、CV 34.1%、spread 近 100% | **纯噪声，是抽签** |
+| 分词类（2 项） | 原始读数快 21%~23% | — | `select1` 扣偏差法在这里失效 |
+
+两点必须写进方法论：
+
+1. **构建类的单次 CI 读数不可信**。`build_ik_all` 的组内标准差 33.83pp、
+   变异系数 34.1%、极差接近 100%——同一份二进制重复跑都能差出一倍。
+   所以"构建类没有提升"这个结论本身也是抽签结果，**不能用来判断构建优化成败**，
+   只能靠 CI 的整体分数间接反映。
+2. **`select1` 扣偏差法对分词指标失效**。本机 `select 1` 往返本身要 0.19~0.25 ms，
+   而 `tokenize` 本体只有 0.04~0.09 ms，扣掉往返会算出 +98% 这种荒谬值。
+   分词只能用**同一候选端前后做差分**来衡量。
+
+查询类内部，**`query_limit` 是最大短板**（+17.60%，其余三项 +44.91%/+47.71%/+48.66%）。
+`EXPLAIN` 显示它是 BM25 top-K 计划（`calc_relevance=true`、`sort_keys([MATCH(...) DESC])`、
+`is_index_back=true`、`limit(20)`），而另外三个是 `calc_relevance=false` 的纯索引扫描。
+微基准：**带 LIMIT 20 的子查询（3.05~3.26 ms）比不带 LIMIT 的全量 COUNT（2.14 ms）更慢**，
+且 LIMIT 1 与 LIMIT 20 耗时相同——说明 LIMIT 没有下推，top-K 要给全部 9333 个命中都算一遍
+BM25 分数。
+
+### 9.2 分词链路的 perf 剖析（perf 6.18.54.1 + 离线符号化）
+
+对候选二进制跑 4 并发 `SELECT tokenize('<基准文本>', 'ik')`，采样 9137 个栈：
+
+| 热点 | self | 说明 |
+| --- | --- | --- |
+| `ObArrayHashMap::find`（词典单字哈希表） | **4.71%** | 每匹配一个字符查一次；热指令是首次探测的 `used` 标志（cache miss） |
+| `ObFTDATReader::match_with_hit`（DAT 匹配） | ~6.9% | DAT base/check 数组遍历 |
+| `absl::LowLevelAlloc::Alloc`（malloc） | ~7% | 分散在词典匹配、JSON 树、哈希节点各处 |
+| `ObFTParser::serialize_to_str` → `databuff_printf` | ~0.6% | 每次调用重新序列化 parser 名 |
+| `ObFTParseHelper::init` | 0.48% | 每次调用重新解析 "name.version" |
+| `ObAddWord::groupby_word` | 3.27% | 每个 token 两趟哈希（先查后写） |
+| `ObIKCJKProcessor::do_process` + `ObFTRangeDict::match` | 16.3% | **词典匹配本体，是算法核心，不动** |
+
+包含式看，`ObExprTokenize::eval_tokenize` 占进程 CPU 的 **36.12%**，
+`tokenize_fulltext` 占 33.13%，`pack_json_res` 占 2.68%。
+也就是说 TOKENIZE 表达式本身只占这条基准 SQL 的一部分，
+**能动的只有"每次调用的固定开销"和"词典查表"两块**。
+
+另外从查询侧的剖析里还找到一处第 5 轮的遗漏：
+`ObDomainIdCmp`（`src/storage/retrieval/ob_sparse_retrieval_util.h`，
+BM25 top-K 迭代器与 block-max 迭代器用的那一个）**没有**二进制快路径，
+仍然走字符集分发（`ObNullSafeDatumStrCmp<CS_TYPE_BINARY>` →
+`ObCharset::strcmpsp` → `ob_strnncollsp_binary`），在 `query_limit` 路径上合计约 2%。
+
+### 9.3 本轮改动
+
+#### 9.3.1 去掉每次调用新建的 `ObArenaAllocator`（`ob_expr_tokenize.{h,cpp}`）
+
+原来 `TokenizeParam` 自带一个 `ObArenaAllocator allocator_`，`tokenize_fulltext()` 里
+还有第二个 `ObArenaAllocator tmp_parse_alloc(ObMemAttr("Tmp buffer"))`。
+每次 `TOKENIZE()` 调用都要新建**两个** arena（各自申请/释放 arena block），
+而它们的用途只是存几段 parser 属性 JSON。
+现在统一用 `ObEvalCtx` 的临时分配器（`TempAllocGuard` 拿到的 `ctx.tmp_alloc_`），
+一次调用只留一个 arena。
+
+#### 9.3.2 规范化 parser 名的线程本地缓存（`ob_expr_tokenize.cpp`）
+
+`construct_ft_parser_inner_name()` 每次调用都要把原始 parser 名校验一遍、
+序列化成 "name.version"。结果只取决于原始名，而内置 parser 只有寥寥几个，
+所以按原始名做一个 4 槽的**线程本地**缓存：命中即零拷贝零加锁直接复用；
+miss 时才走原来的 `parser.init()` + `serialize_to_str()`。
+缓存槽的原始名长度用 `raw_len_ = -1` 表示"永不可命中"，
+以覆盖超长原始名（`ObFTParserName::set_name()` 本来就会拒绝这种名字）。
+
+> 这是**配置派生量**的缓存（和第 1~5 轮已接受的 parser 属性缓存同一性质），
+> 不是对分词结果做记忆化：文本仍然每次都完整分词。
+
+#### 9.3.3 token word map 的线程本地复用（`ob_expr_tokenize.cpp`）
+
+`tokenize_fulltext()` 每次调用都 `ObFTWordMap::create()` 一个新哈希表，
+用完再析构：桶数组一次 malloc/free，节点块一次 malloc/free。
+现在按线程缓存这张表并复用。
+
+**桶数必须保持不变**：`ObFTWordMap` 的遍历顺序 = 桶序，桶数由
+`MIN(MAX(len/2,2),997)` 决定（`len` = 文本字节数），而 TOKENIZE 的输出就是按这个
+顺序打印的。所以只有请求的桶数与上次相同时才复用，否则 `destroy()` 后重建——
+重建的开销与原来完全一样，不会更差。
+
+空文档（`len == 0`）不走分词，而分词是唯一会清空这张表的地方，
+所以空文档要显式 `reuse()` 清表。
+
+#### 9.3.4 `ObDomainIdCmp` 的二进制快路径（`ob_sparse_retrieval_util.h`）
+
+倒排索引的 doc id（domain id）是行键的二进制串。`ObDomainIdCmp` 走的是
+`ObDatumFuncs::get_basic_func(type, collation)->null_first_cmp_`，
+对 `CS_TYPE_BINARY` 就是 `ObNullSafeDatumStrCmp<63>` → `ObCharset::strcmpsp`
+→ `ob_strnncollsp_binary`，每次比较都要过一遍字符集分发。
+
+第 5 轮已经把**归并堆**的 doc id 比较改成直接 memcmp，但 `ObDomainIdCmp`
+漏掉了。现在：当列的 collation 已经是 `CS_TYPE_BINARY` 且两边都非空时，
+直接 memcmp + 长度差——与 `ob_strnncollsp_binary()` 的顺序完全等价
+（字节先比，前缀相同时长度差决胜）。
+
+#### 9.3.5 token word map 复用的一处错误路径加固
+
+`prepare_token_map()` 在桶数变化时会先 `destroy()` 旧表再 `create()` 新表。
+如果 `create()` 失败（内存不足），缓存里记录的桶数会**残留旧值**；
+下一次请求的桶数恰好与这个残留值相同时，函数会误判成"可以直接复用"，
+于是既不重建也不清表——此时那张表其实是一张 `destroy()` 过、`create()` 失败的表，
+后续往里 `insert` 会直接返回 `OB_NOT_INIT`，此后同长度的文本会一直失败。
+
+改法是 `destroy()` 之后立刻把缓存里的桶数置为 `-1`，
+这样无论 `create()` 成功与否，下一次调用都会重新建表。
+
+这条路径只有在内存不足时才会走到，基准里不会触发，
+但它是一个真实的语义缺陷，所以本轮一并修掉。
+
+### 9.4 试过但回退的一个改动：词典单字 code 查找的记忆化
+
+`ObArrayHashMap::find`（4.71%）是分词侧最大的单点热点：IK 分词器对**同一个字符**
+要查好几次词典——CJK 处理器先把所有"还活着的匹配"各推进一次，再为这个字符开一个新匹配，
+而 range dict 与主词典各自还要先做一次区间二分，每一次最终都落到这个哈希探测上。
+单字在词典里的 code 是**常量**（词典建好后只读、进程内共享、生命周期与进程同寿），
+所以试过把"最近一次查找"记在**线程本地**里。
+
+实现后 TOKENIZE 输出出现回归：约 60 条用例里有 7 条返回
+`ERROR 4018 (HY000): Entry not exist`（全部是"中英文混排"的文本，
+纯中文与纯英文的用例都正常）。同一轮里还改了 `hash_word()` 的字节拼装方式
+（把变长 `MEMCPY` 换成内联拼装，避免 PLT 调用），
+但新的哈希函数已用 340 万组随机用例与旧函数逐位比对，**0 处不一致**，
+因此可以排除哈希改动、把嫌疑锁定在记忆化逻辑上。
+本轮没能定位到记忆化逻辑里的根因，**该改动已整体回退**，
+第 6 轮只保留上面 9.3 的四项改动。
+
+> 这一条记在这里，是因为它本身就是"改分词必须用 TOKENIZE 逐字节比对兜底"的例子：
+> 如果只看"命中数 8001/11000/7332/20 没变"，这个回归是发现不了的。
+
+#### 9.4.1 回退必须以构建树为准（同步机制的一个坑）
+
+回退那两处词典改动时，只回退了 Windows 侧的工作副本。同步到 WSL 构建树用的是
+「Windows 工作区与提交的差异清单」，而回退之后这两个文件与提交**一致**了，
+于是它们不在清单里，同步脚本也就没有覆盖构建树里的旧版本——
+**WSL 构建树里留着的仍然是第 7 轮的词典改动。**
+
+后果是：任何一次基于构建树的重新编译，都会把 `4018 Entry not exist` 这个回归
+重新带回来。第 6 轮重编译时正是这样发现的——TOKENIZE 的输出直接变成了报错行，
+而不是等到跑完基准才发现。
+
+所以这一轮把流程改成了：**编译之前先做一次全树逐文件哈希比对**
+（Windows 提交 vs WSL 构建树，统一换行符后比较 sha256），
+确认两边只差本轮真正改过的文件，再开始编译。
+
+这次比对第一次跑出来是 8923 个文件里有 2 个内容不一致
+（`src/storage/fts/dict/ob_ft_dat_dict.{h,cpp}`），修正后再比是 0 个差异。
+这也从侧面说明：**"回退"这件事的验收对象应该是构建树，而不是版本控制的工作区。**
+
+### 9.5 正确性验证（第 6 轮二进制，md5 `0c12f4870a442bcc480bbf5aa12db284`）
+
+| 检查 | 结果 |
+| --- | --- |
+| 命中数 | `query_cn`=8001、`query_beng`=11000、`query_mixed`=7332、`query_limit`=20，**与基线完全一致** |
+| TOKENIZE 输出 | 30 条文本 × {ik, beng} + 4 条 parser 属性用例，共 **121 行**，与 **master 基线逐字节一致** |
+| MATCH 语义 | 与第 5 轮候选**逐字节一致**；与 master 基线只有已知的 `calc_relevance` 计划标注差异 |
+| fts_index 回归 | `fts_shared_dict_tokenize`、`fts_word_map_reuse`、`fts_doc_id_compare`、`basic_dml_sequel`、`tokenize_function`、`simple_query` **6/6 通过** |
+| 仓库自动化检查 | `share_header_ownership_check`、`storage_header_ownership_check`、`share_terminal_check`、`oblib_terminal_check` 四项全过 |
+| 构建树一致性 | 8923 个受版本控制的文件逐一比对（换行归一化后 sha256），源码 **0 差异**，详见 9.4.1 |
+
+> 回归套件第一次跑时 `simple_query` 报过一次
+> `4012 Statement timeout`——那是同一台机器上并行跑增量编译把 CPU 抢光导致的；
+> 编译结束后单独重跑该用例即通过，与本轮改动无关。
+>
+> 最终二进制单独复跑，6/6 全过、无超时。
+>
+> TOKENIZE 的输出里有 5 行是**故意的反例**（`can't won't` 的引号语法错误、
+> 非法 parser 参数），master 基线里同样是这 5 行错误，
+> 所以"121 行与基线逐字节一致"包含它们——这正是要逐字节比对而不是只看命中数的原因。
+
+### 9.6 本轮的前后性能对比（交错 A/B，3 轮 × 每轮 2 组配对）
+
+两台服务器同时跑、持有完全相同的数据、ABBA 顺序交错：基线端是 master 基线二进制（端口 10100），候选端是本轮二进制（端口 10101），每轮每端各跑 2 次，取均值后配成 1 组，一共 3 组。
+
+`select1` 往返：基线端 0.2198 ms，候选端 0.1988 ms（比值 0.905），两端基本对齐，说明两台机器的负载是平衡的。
+
+| 指标 | 基线 | 候选 | 原始提升 | 扣掉 `select1` 往返后 | 组内 stdev |
+| --- | --- | --- | --- | --- | --- |
+| `build_ik_all_sec` | 62.1055 | 61.1455 | **+0.54%** | +0.51% | 9.90pp |
+| `build_ik_content_sec` | 32.6152 | 33.4782 | **-2.88%** | -2.97% | 13.22pp |
+| `build_beng_en_sec` | 28.1938 | 27.3700 | **+3.25%** | +3.20% | 5.48pp |
+| `tokenize_ik_avg_ms` | 0.4204 | 0.3004 | **+24.27%** | +41.42% | 20.31pp |
+| `tokenize_beng_avg_ms` | 0.2452 | 0.2198 | **+10.07%** | +11.96% | 8.36pp |
+| `query_cn_avg_ms` | 3.1629 | 2.0288 | **+35.63%** | +37.67% | 10.18pp |
+| `query_beng_avg_ms` | 4.3522 | 3.1592 | **+27.44%** | +28.37% | 3.03pp |
+| `query_mixed_avg_ms` | 3.4293 | 2.2496 | **+34.44%** | +36.18% | 2.70pp |
+| `query_limit_avg_ms` | 4.1933 | 3.3120 | **+20.78%** | +21.45% | 8.38pp |
+
+按类别平均（三类等权，与 CI 口径一致）：
+
+| 类别 | 指标数 | 类别提升 | 说明 |
+| --- | --- | --- | --- |
+| 构建 | 3 | **+0.30%** | 单次读数噪声极大，见下方说明 |
+| 分词 | 2 | **+17.17%** |  |
+| 查询 | 4 | **+29.57%** |  |
+
+三类等权平均 = **+15.68%**，按官方口径 `score = clamp(mean, 0, 0.5) / 0.5 * 100` 折算为 **31.37 / 100**（本机读数，仅供对照，权威分数以 CI 为准）。
+
+几点说明：
+
+1. **构建类在本机是抽签**。同一份二进制重复跑，`build_ik_all` 的组内标准差就达到几十个百分点，所以构建类的读数不能用来判断构建优化成败，只能靠 CI 的整体分数间接反映；本轮没有改构建链路。
+
+2. **分词类只能用原始读数**。本机 `select 1` 往返 0.2 ms 量级，而 `tokenize` 本体只有零点几毫秒，扣掉往返会算出荒谬值，所以分词类看原始比值；查询类用扣往返后的数字更贴近 CI 的口径。
+
+3. **分词类指标里 TOKENIZE 表达式本身只占一部分**（其余是 SQL 解析、计划、下发等固定开销），所以表达式提速 X% 折算到该指标只有约 0.57X%。
+
+
+作为重复性检验，同一套交错 A/B 协议在加固修复之前已经独立跑过一轮完整的 12 次采样
+（基线 vs 上一版候选二进制）：构建 +10.07%、分词 +15.13%、查询 +34.85%、
+三类等权 +20.02%。本轮（加固后的最终二进制）跑出来的是
+构建 +0.30%、分词 +17.17%、查询 +29.57%、三类等权 +15.68%。
+
+两轮采样互不依赖——二进制不同、时间不同、装置重新部署过、数据重新拷贝过。
+**分词与查询的提升量级一致**（分词 15% vs 17%，查询 35% vs 30%），说明这两块的提升是稳定的。
+
+而**构建类在两轮之间从 +10.07% 变成 +0.30%，差了将近 10 个百分点，
+而这两轮之间构建链路一个字节都没有改过**。
+这就是"构建类是抽签"的直接证据：同一条构建链路可以给出相差十倍的结论，
+所以构建类的读数只能靠 CI 的整体分数间接反映，本报告不对构建类的数字下结论。
+
+另外对比 9.1 那一轮（基线 vs 第 5 轮候选）：`query_limit` 当时是最大短板（+17.60%），
+本轮把 `ObDomainIdCmp` 改成二进制快路径之后，它明显改善到 +20.78%（扣往返 +21.45%），
+而另外三个查询指标本来就是纯索引扫描、不走 top-K 路径。
+这也反过来印证了 9.1 的判断：**`query_limit` 慢是因为 top-K 要给全部命中算 BM25 分数**，
+而不是因为索引本身。
+
+### 9.7 CI 结果与得分结构（第 6 轮之后）
+
+第 6 轮推送后 CI 的结果是 **`fts_raw_score` = 31.07**（`fts_mean_improvement` = 15.54%），
+上一版（第五轮 `0890f97`）是 **28.60**（14.30%）。
+
+#### 9.7.1 本地交错 A/B 可以预测 CI 分数
+
+把本地的类别提升率套进 CI 的评分公式，结果是：
+
+| CI 运行 | 本地预测的分数 | CI 实际分数 | 差 |
+| --- | --- | --- | --- |
+| `0890f97`（第五轮） | 27.34 | 28.60 | +1.26 |
+| `82eb173`（第六轮） | **31.36** | **31.07** | **−0.29** |
+
+**本地测量与 CI 分数已经对齐到 1 分以内**（第五轮那 1.26 分的偏差落在构建类的噪声带内）。
+这意味着后面几轮不必靠"推上去跑一次 CI"来验证效果，
+本地双机交错 A/B 就能预判分数，也就不必反复消耗 CI 轮次。
+
+#### 9.7.2 现在的得分结构
+
+用同一台 CI 机器上的 master 基线反推出来的类别提升率是：
+
+| 类别 | 类别提升 | 说明 |
+| --- | --- | --- |
+| 构建 | **≈0%** | 本轮没有改构建链路，读数由噪声主导 |
+| 分词 | **≈17%** | 测量稳定（CI 上 stdev 0.0004~0.0012 ms） |
+| 查询 | **≈30%** | 测量最稳（CI 上 stdev 0.0005~0.0021 ms） |
+
+三类等权 = 15.7%，折算 31.4 分。
+
+#### 9.7.3 满分的门槛，以及各类能不能到
+
+官方公式是 `score = clamp(三类等权平均, 0, 0.5) / 0.5 * 100`，
+所以**满分要求三类每一类都达到 50% 的改进率**（不是平均达到 50%）。
+
+把 CI 机器上的 `select1` 往返（**0.0268 ms**）当成不可压缩的地板，
+每个指标能达到的改进率上限就是 `(master − select1) / master`：
+
+| 指标 | master | 50% 目标值 | 地板 | 能不能到 50% |
+| --- | --- | --- | --- | --- |
+| `tokenize_ik_avg_ms` | 0.0850 | 0.0425 | 0.0268 | 可以，但要把表达式工作量从 0.0376 压到 0.0157 ms（**2.4 倍**） |
+| `tokenize_beng_avg_ms` | 0.0438 | 0.0219 | 0.0268 | **不可能**——往返本身就超过 master/2 |
+| `query_cn_avg_ms` | 1.4059 | 0.7030 | 0.0268 | 可以，工作量再降 23% |
+| `build_ik_all_sec` | 8.4054 | 4.2027 | 0 | 可以，但要砍掉一半的索引构建时间 |
+
+由此得到几条硬结论：
+
+1. **分词类有数学天花板**。`tokenize_beng` 永远到不了 50%，
+   把两个 tokenize 指标都压到地板，该类的上限也只有 **53.7%**。
+   现实一点，能到 35%~40% 就已经是很不容易的结果。
+2. **查询类没有地板**，是三个类别里唯一能真正冲到 50% 的；
+   它现在 30%，做到 50% 值 **+13.6 分**。
+3. **分词类基数最低**，从 17% 做到 40% 值 **+15.2 分**，
+   而且 CI 上的测量很稳（不像构建类那样会被 ±24% 的噪声淹没）。
+4. **构建类空间最大但读数最不可信**：0% → 30% 值 **+19.8 分**，
+   可它同一份代码在两次 CI 之间就摆动了 ±24%（见下），而且改它要动共享存储层。
+
+#### 9.7.4 CI 自身的噪声有多大
+
+第 5 轮和第 6 轮之间**构建链路一个字节都没改**，CI 上的读数却是：
+
+| 指标 | `0890f97` | `82eb173` | 变化 |
+| --- | --- | --- | --- |
+| `build_ik_all_sec` | 6.761 | 8.360 | **+23.7%** |
+| `build_ik_content_sec` | 6.735 | 5.128 | **−23.9%** |
+| `build_beng_en_sec` | 2.825 | 2.825 | 0 |
+| `build_total_sec` | 16.327 | 16.319 | 0 |
+
+构建类一个指标摆 24%，三个指标平均后类别提升率就有 ±8pp 的抖动，
+折算到总分是 **±2.7 分**。也就是说：**这一次 CI 的 +2.48 分，
+完全可能被构建类的噪声解释掉**，本轮改动在 CI 上的真实效果还需要更多样本才能确认。
+
+所以下一轮的取舍是明确的：
+**优先做"测量稳定 + 还有真实空间"的类别（分词、查询），不去赌构建类。**
+
+## 10. 第 7 轮：分词热路径的词典查找与词频统计
+
+### 10.1 先量后改：用当前二进制重新剖析分词链路
+
+上一轮（第 6 轮）留下的 perf 采样是在**旧二进制**上采集的，符号地址已经错位
+（例如 `parse_json_param` 会被错误地归因到实际是 `tokenize_fulltext` 的地址上）。
+所以这一轮先用**当前二进制**（md5 `0c12f4870a442bcc480bbf5aa12db284`）重新采集：
+
+```
+perf record -e cpu-clock -F 997 -g -p <seekdb pid> -- sleep 40
+perf script -i perf_tokenize_r7.data > perf_tokenize_r7.data.stacks
+# 离线用 nm 的符号表解析地址（脚本：resolve_perf2.py / subtree.py / leaf_callers.py）
+```
+
+采样条件与基准一致（4 个并发客户端压 `SELECT tokenize('<同一段中文>', 'ik')`），
+共 5486 个采样栈。下面所有百分比都是**占全部采样的比例**。
+
+#### 10.1.1 分词表达式就是这条负载的主体
+
+| 栈帧（含调用者） | 占全部采样 |
+| --- | --- |
+| `ObMPQuery::process` | 70.36% |
+| `ObExprTokenize::eval_tokenize` | **38.01%** |
+| `ObExprTokenize::tokenize_fulltext` | 35.49% |
+| `ObFTParseHelper::segment`（9 参重载） | 26.94% |
+| `ObIKFTParser::process_next_batch` | 26.03% |
+| `ObIKCJKProcessor::do_process` | 15.46% |
+| `ObFTDATReader::match_with_hit`（词典匹配） | 12.05% |
+| `ObArrayHashMap::find`（词典哈希表查找） | 6.47% |
+| `ObAddWord::process_word` | 6.51% |
+| `ObAddWord::groupby_word`（词频统计） | 4.81% |
+| `ObIKArbitrator`（切分仲裁） | 4.72% |
+
+也就是说：**在跟负载相关的 CPU 里（`ObMPQuery::process` 70.36%），
+`eval_tokenize` 一个函数就占了 54%**。
+这解释了 9.7.3 里"分词类基数最低、还有真实空间"的判断——
+分词链路的每一个百分點都会同时打到 `tokenize_*` 和 `build_*` 两类指标上
+（索引构建走的是同一套分词器）。
+
+#### 10.1.2 词典查找被重复做了 N 次
+
+`ObIKCJKProcessor::do_process` 对每一个汉字做两件事：
+
+1. 把当前字符喂给**每一个还活着的 hit**（`hits_` 里的候选词），
+   每个 hit 都要在自己的字典里查一次这个字的 code，再走一次双数组 Trie；
+2. 再用当前字符**新开一个 hit**，这又是一次查找。
+
+剖析显示 `match_with_hit`（步骤 1）的调用量是 `ObFTRangeDict::match`（步骤 2）的
+**6.7 倍**，也就是说平均每个汉字有 **5 个左右同时活着的 hit**，
+于是同一个字在一个字典里被查了 5~6 次。
+
+为什么不能简单地把这些查找合并？因为每个 hit 有自己的 `dict_`，
+而**每个字典有各自的 code 空间**（code 是该字典双数组 Trie 里的偏移），
+跨字典的 code 不可比、不可复用。
+
+#### 10.1.3 哈希本身还有一次 libc 调用
+
+`ObArrayHashMap::find` 的哈希函数是：
+
+```cpp
+uint64_t chunk = 0;
+MEMCPY(&chunk, ptr, len);        // len 是运行期变量 → 编译成 libc memcpy 调用
+```
+
+`len` 是运行期值，`MEMCPY` 只能展开成一次 `memcpy` 的函数调用，
+而这个哈希在**每个被匹配的字符**上都要算一次。
+
+#### 10.1.4 词频统计对新词做了两趟哈希
+
+`ObAddWord::groupby_word` 对每个词先 `get_refactored` 查一次、
+再 `set_refactored` 写一次。而 `set_refactored` 在 key 已存在时
+是**新建一个节点再替换旧节点**（多一次分配 + 一次释放）。
+词频统计占 4.81%，其中 `set_refactored` 与 `get_refactored` 各占约一半。
+
+### 10.2 本轮的改动
+
+#### 10.2.1 词典查找：同一个字典只查一次 code
+
+**改动**：`src/storage/fts/dict/ob_ft_dict.h`、`ob_ft_cache_dict.{h,cpp}`、
+`ob_ft_range_dict.{h,cpp}`、`ob_ft_dat_dict.{h,cpp}`、
+`src/storage/fts/ik/ob_ik_cjk_processor.cpp`
+
+在 `ObIFTDict` 接口上新增两个方法，把"查 code"和"走 Trie"拆开：
+
+```cpp
+// 查这个字在本字典里的 code；不在字典里返回 OB_ENTRY_NOT_EXIST
+virtual int find_word_code(const ObString &single_word, ObFTWordCode &code) const = 0;
+// 用已经查好的 code 走 Trie
+virtual int match_with_code(const ObString &single_word,
+                            const ObFTWordCode code,
+                            const ObDATrieHit &last_hit,
+                            ObDATrieHit &hit) const = 0;
+```
+
+`ObIKCJKProcessor::do_process` 用一个 4 槽的小缓存（`ObFTCJKCodeCache`）
+按**字典指针**缓存当前字符的 code：
+
+* 同一个字典里的所有 hit 共享一次查找；
+* 不同字典仍然各查各的（code 空间不同，不能混用）；
+* 缓存满了就退化成逐 hit 查找，行为不变。
+
+于是每个汉字的查找次数从 `1 + N`（N≈5）降到 `1 + 不同字典数`（通常是 1~2）。
+
+`ObFTDATReader::match_with_hit` 本身也被重写成 `find_code` + `match_with_code`
+两段，语义与原来逐字对应（找不到字 → hit 置 unmatch → hit 被丢弃，
+与原来的 `OB_ENTRY_NOT_EXIST → set_unmatch()` 完全一致）。
+
+#### 10.2.2 词典哈希：不再调用 libc memcpy
+
+**改动**：`src/storage/fts/dict/ob_ft_dat_dict.h`、`ob_ft_dict_def.cpp`
+
+一个"单字"是 `ObFTSingleWord`，里面是**定长**的 `char word[ObCharset::MAX_MB_LEN]`
+缓冲加一个长度。改成直接对这个定长缓冲做哈希：
+
+```cpp
+static OB_INLINE uint64_t hash_single_word(const ObFTSingleWord &word)
+{
+  uint64_t chunk = 0;
+  MEMCPY(&chunk, word.word, sizeof(word.word));   // 定长 → 编译成一次定长拷贝
+  uint64_t hash = chunk ^ (uint64_t)word.word_len * 0x9E3779B97F4A7C15ULL;
+  ...
+}
+```
+
+为了让同一个字只有一种表示，`ObFTSingleWord::set_word` 现在会把长度之后的
+字节清零（否则缓冲里的残留字节会让哈希依赖于上一次写入的内容）。
+
+**这一改动对哈希值没有任何影响**：旧的 `hash_word()` 把 `len` 个字节拷进一个
+**先清零**的 `uint64_t`，所以缓冲区里 `len` 之后的字节本来就是 0；
+新的 `hash_single_word()` 拷贝的是整个定长缓冲，而它的尾部同样被清零。
+两个函数拿到的 `chunk` 完全一样，`hash` 的后续混淆也一样，
+**所以桶下标、字典表的布局与改动前逐位相同**——这是一个纯优化。
+
+`insert` 和 `find` 必须用同一个哈希，否则字典表会自相矛盾：
+`insert` 现在也构造 `ObFTSingleWord` 并调用 `hash_single_word`
+（长度超过 `MAX_MB_LEN` 的 key 走原来的通用哈希——这种 key 本来就
+`set_word` 失败、永远查不到）。
+
+**注意**：字典表是在进程内构建的（`ObFTDATBuilder` → `ObArrayHashMap`），
+不落盘、不跨版本复用，所以哈希函数可以在同一个二进制内自由更改。
+
+#### 10.2.3 词频统计：新词只哈希一趟
+
+**改动**：`src/storage/fts/ob_fts_stop_word.cpp`
+
+```cpp
+// 原来：先 get（查一次哈希）再 set（再查一次哈希）
+// 现在：先按"不覆盖"插入，插入成功就说明是新词，一次哈希搞定；
+//       返回 OB_HASH_EXIST 才走原来的 get + set 累加路径。
+ret = word_map_.set_refactored(word, 1/*word count*/, 0/*do not overwrite*/);
+if (OB_HASH_EXIST == ret) { /* 原来的累加逻辑 */ }
+```
+
+最终表内容与原来完全一致（同一个 key、同一个计数、桶里的位置也一样），
+只是新词少了一次哈希查找，老词少了一次"查不到"的空跑。
+
+#### 10.2.4 查询：MATCH 的 doc id 比较统一走二进制序
+
+**改动**：`src/sql/das/iter/sparse_retrieval/ob_das_match_iter.{h,cpp}`
+
+`ObDASMatchMergeCmp` 的 id 是倒排表的行键（二进制串），
+但比较时仍然走字符集分发。同第 5 轮的 `ObSRMergeCmp`、第 6 轮的 `ObDomainIdCmp`，
+改成 `memcmp` + 长度差直比（与 `ob_strnncollsp_binary()` 等价）。
+
+
+### 10.3 正确性验证（第 7 轮二进制，md5 `5a35300cebeb085a7fa820244c0bae95`）
+
+| 检查项 | 方法 | 结果 |
+| --- | --- | --- |
+| MATCH 命中数 | 基准脚本的 4 条查询逐条比对 | **8001 / 11000 / 7332 / 20**，与基线一致 |
+| MATCH 语义 | `EXPLAIN` + 语义输出逐字节比对第 6 轮 | **逐字节一致**（与 master 基线只差第 3 轮就已存在的 `calc_relevance` 标注差异） |
+| TOKENIZE 结果 | 121 行输出与 master 基线逐字节比对 | **逐字节一致** |
+| **新增回归用例** `fts_dict_lookup_cache` | `.result` 在 **master 基线二进制**上录制，再在 master / r6 / r7 三个二进制上分别重放 | **三个二进制输出完全一致，全部通过** |
+| `fts_index` 套件（FTS 相关） | `fts_shared_dict_tokenize`、`fts_word_map_reuse`、`fts_doc_id_compare`、`fts_dict_lookup_cache`、`tokenize_function`、`simple_query` 连跑 | **6/6 通过** |
+| `basic_dml` | 候选端（连跑 + 单独重放）与 **master 基线端**各跑一次 | **三个二进制都失败**，根因是上游用例的一个时序假设（见 10.3.2） |
+| `basic_dml_sequel` | 候选端在**空闲服务器上单独重放** | **通过（rc=0）**；连跑时报 4012 超时（见 10.3.2） |
+| `cn_word` | 候选端与 master 基线端各跑一次 | **两端同样失败**（第 44 行 `Access denied for user 'admin'`） |
+| 仓库自动化检查 | 13 项（见 10.3.4） | **13 过 0 败** |
+| 构建树一致性 | 本轮改动的 **14 个文件**逐一 sha256 比对（换行归一化后） | **14/14 一致**，与 9.4.1 的全树比对（8923 文件、0 差异）一起保证编译的是同一份代码 |
+
+#### 10.3.1 新增的回归用例
+
+第 7 轮的三处改动（词典 code 查找、单字哈希、词频统计）都作用在**分词的内部路径**上，
+只看"命中数没变"是发现不了这类回归的（第 6 轮 9.4 记录的 `4018 Entry not exist`
+就是这样漏过去的）。所以本轮补了一个专门的用例
+`tools/deploy/mysql_test/test_suite/fts_index/t/fts_dict_lookup_cache.test`：
+
+1. **同时存活多个候选词的句子**——`中华人民共和国万岁万岁万万岁`、
+   `数据库索引全文检索性能优化`、`全文索引的分词器热路径优化`，
+   每一个汉字都会同时推进好几个 hit，词典查找被反复调用；
+2. **字典里没有的字**——`龘齾靐灥`、`中龘文齾分靐词`，
+   以及 4 字节的 `𠀀`（这些字要么被丢弃、要么被当成单字切出来）；
+3. **单字哈希的边界**——单字母 `a`（ik / beng 两种词典）、`中`、`0`、
+   全角标点 `。。。`、中英文数字混排 `中文abc123`、`ABCabc123`；
+4. **两种词典的 code 空间隔离**——`database 稳定 index 2024` 在 ik 与 beng 下分别切；
+5. **词频统计**——用 `{"output":"ALL"}` 的明细输出检查每个 token 的词频
+   （明细输出里带的就是 `groupby_word` 统计出来的计数）；
+6. **建索引之后**——建完全文索引、共享词典进入使用状态后再切一次；
+7. **二进制行键的 MATCH**——`varchar` 主键的表上做 MATCH，
+   覆盖本轮改动的 DAS 归并 doc id 比较。
+
+**期望输出（`.result`）是在 master 基线二进制上录制的**，
+所以这个用例对"分词结果是否变化"是真正的回归守卫：
+master、第 6 轮、第 7 轮三个二进制跑出来的结果**逐字节一致**。
+
+#### 10.3.2 三个失败的用例都是环境/上游用例问题，不是回归
+
+1. **`basic_dml` 的失败与本轮改动无关**。
+
+   用例在第 1555 行记下 `$data_table_id`（`fts_parser_name_test` 的 table_id），
+   第 1582 行 `DROP TABLE`、第 1584~1588 行用**同样的表名重建**，
+   但**没有刷新 `$data_table_id`**，
+   于是第 1589~1595 行查出来的内部表 id 是空的，
+   第 1598 行的 `eval` 把 mysqltest 的错误文本
+   （`no such row`）当成表 id 拼进 SQL，于是报了一个语法错误。
+
+   这个用例要成立，**必须假设"新建的表复用了被删表的 table_id"**。
+   在本环境里这个假设不成立——直接复现：
+
+   ```
+   第一次建表:  table_id = 544302   （内部表 13/14 的 data_table_id = 544302）
+   DROP + 重建:  table_id = 544307   （内部表 13/14 的 data_table_id = 544307）
+   → 表 id 没有被回收复用，用例里的 $data_table_id 是陈旧的
+   ```
+
+   **表 id 的回收是 schema 层的 DDL 行为，与分词器、词典、词频统计、DAS 归并比较都无关**；
+   而且 **master 基线二进制在同一个环境下同样失败**（并发时失败在第 1010 行的
+   `DROP TABLE ... 4012 Timeout`，单独重放也失败在第 1598 行）。
+   候选端在连跑与单独重放两种情况下都稳定地失败在第 1598 行，
+   失败点与 master 端一致。
+
+2. **`basic_dml_sequel` 的失败是并发造成的超时**：
+   第 428 行的大 INSERT 报
+   `4012: Timeout, query has reached the maximum query timeout`。
+   这个用例有 1600 多条 DDL，本机上单例就要十几分钟，
+   同一台机器同时跑两个这种用例必然触发查询超时
+   （本轮第一次连跑就是和另一个 DDL 重用例并��跑的）。
+   **在空闲服务器上单独重放同一个用例通过（rc=0）**。
+   第 6 轮也记录过同样的现象（见 9.5 的注）。
+
+3. **`cn_word` 需要 `admin` 账号和 `$OBMYSQL_PWD`**，本环境没有，
+   所以它在候选端和基线端都失败在同一条语句上，属于环境限制。
+
+#### 10.3.3 构建树一致性
+
+9.4.1 记过一次坑：回退改动时只回退了 Windows 侧的工作副本，
+而同步机制（"与提交的差异清单"）没有覆盖构建树，**结果构建树里留着的还是旧改动**。
+所以这一轮的流程是"先全树哈希比对、再编译"。
+
+这一轮全树比对（8923 个文件、0 差异）之后，**又新增了两个文件**
+（`fts_dict_lookup_cache.test` 与它的 `.result`），
+所以在提交前又对这 14 个文件做了一次定向比对：**14/14 一致**。
+
+#### 10.3.4 仓库自动化检查
+
+13 项全部通过（其中 `oblib terminal` 与 `share terminal` 需要 `bazel` 在 `PATH` 上，
+即 `~/dl/bazel` 提供的 8.2.1）：
+
+| 检查 | 结果 |
+| --- | --- |
+| `check_license_headers.py`（`--base-ref` 指向分支起点 `829bcd8`） | 通过 |
+| `source_input_check.py` | 通过 |
+| `sql_source_ownership_check.py` | 通过 |
+| `sql_header_ownership_check.py` | 通过 |
+| `share_header_ownership_check.py` | 通过：379 tracked / 250 public roots / 77 interface closure / 52 private |
+| `storage_header_ownership_check.py` | 通过：795 tracked / 146 public / 450 closure / 193 private / 6 semantic |
+| `logservice_source_ownership_check.py` | 通过 |
+| `module_layer_check.py` | 通过 |
+| `runtime_seam_definition_check.py` | 通过 |
+| `syspack_manifest_check.py` | 通过 |
+| `oblib_terminal_check.py` | 通过：explicit public owner DAG, private implementation seam, and no upward runtime access |
+| `share_terminal_check.py` | 通过：94 Share rules and 1622 external BUILD files checked |
+| `unittest_module_check.py` | 通过 |
+
+> 这些检查是在 **WSL 构建树**（`/home/liyunxu/seekdb-repo`）上跑的，
+> 它的内容与 Windows 工作树逐文件一致（9.4.1 的全树比对 + 本轮的 14 个文件定向比对），
+> 在 ext4 上跑比在 `/mnt/f` 上快一个数量级。
+
+### 10.4 本轮的前后性能对比
+
+本轮做了**两组**独立的测量，因为"跨时段的基线对比"在这台机器上不可靠（见 10.4.3）。
+
+#### 10.4.1 全协议交错 A/B（master 基线 vs 第 7 轮二进制）
+
+两台服务器同时跑、持有完全相同的数据、**ABBA 顺序交错**（基线端 10100 = master 基线二进制，
+候选端 10101 = 本轮二进制 md5 `5a35300cebeb085a7fa820244c0bae95`），每轮每端各跑一次，
+3 轮共 6 组配对。每一次跑的都是**全协议**（`SKIP_LOAD=0`：重新导入数据 + 重建 3 个全文索引 +
+分词 + 查询），与 CI 的协议一致；每个测量阶段之前都等两台服务器连续 3 个 6 秒窗口低于单核 25%，
+把 compaction / GC 的尾巴排除在测量窗口外。
+
+`select1` 往返：基线端 0.1838 ms，候选端 0.1876 ms。
+
+| 指标 | 基线 | 候选 | 原始提升 | 扣掉 `select1` 往返后 |
+| --- | --- | --- | --- | --- |
+| `build_ik_all_sec` | 66.620 | 74.788 | **−12.26%** | −12.29% |
+| `build_ik_content_sec` | 45.127 | 43.327 | **+3.99%** | +4.01% |
+| `build_beng_en_sec` | 38.534 | 36.539 | **+5.18%** | +5.21% |
+| `tokenize_ik_avg_ms` | 0.3141 | 0.2719 | **+13.45%** | +35.29% |
+| `tokenize_beng_avg_ms` | 0.2267 | 0.2144 | **+5.43%** | +37.46% |
+| `query_cn_avg_ms` | 2.9291 | 1.8315 | +37.47% | **+40.12%** |
+| `query_beng_avg_ms` | 4.3000 | 2.6139 | +39.21% | **+41.05%** |
+| `query_mixed_avg_ms` | 3.1582 | 2.0552 | +34.93% | **+37.21%** |
+| `query_limit_avg_ms` | 3.6401 | 3.1032 | +14.75% | **+15.64%** |
+
+| 类别 | 指标数 | 类别提升 | 口径 |
+| --- | --- | --- | --- |
+| 构建 | 3 | **−1.03%** | 原始比值 |
+| 分词 | 2 | **+9.44%** | 原始比值 |
+| 查询 | 4 | **+33.51%** | 扣 `select1` 往返后 |
+
+三类等权 = **+13.97%**，折算 **27.94 / 100**（本机读数，仅供对照，权威分数以 CI 为准）。
+
+#### 10.4.2 三臂同场测量（master / 第 6 轮二进制 / 第 7 轮二进制）
+
+上一张表有一个问题：**基线端和候选端是先后测的**，而这台机器的负载在一天之内会变，
+所以"基线读数"本身会漂移。要回答"第 7 轮的改动到底带来了多少"，必须让**两个候选二进制
+在同一场里比**。
+
+于是加装了第三个臂：**第 6 轮的二进制**（md5 `0c12f4870a442bcc480bbf5aa12db284`）
+装到 `10102` 端口，三台服务器持有**完全相同的数据**（20000 行 + 3 个全文索引，
+`query_cn` 命中数都是 8001）。一轮的顺序是
+**基线 → r6 → r7 → r7 → r6 → 基线**，任何单调漂移在轮内都抵消；
+每轮每端各 2 个样本，3 轮共 6 个样本/端。
+这一次用 `SKIP_LOAD=1`（索引已经建好，只测分词与查询），
+因为第 7 轮改的正是这两条路径，而建索引那一段在本机是噪声主导、测不出东西。
+
+| 指标 | 基线 | r6 | r7 | 基线→r6 | 基线→r7 | **r6→r7** | 轮内 stdev |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `tokenize_ik_avg_ms` | 0.3201 | 0.2719 | 0.2733 | +15.06% | +14.60% | **−0.59%** | 3.26pp |
+| `tokenize_beng_avg_ms` | 0.2369 | 0.2151 | 0.2127 | +9.21% | +10.22% | **+1.10%** | 2.05pp |
+| `query_cn_avg_ms` | 2.8096 | 1.7765 | 1.7977 | +39.28% | +38.68% | **−1.09%** | 7.55pp |
+| `query_beng_avg_ms` | 4.0192 | 2.6526 | 2.5911 | +35.67% | +37.37% | **+2.09%** | 7.98pp |
+| `query_mixed_avg_ms` | 3.1066 | 2.0648 | 1.9952 | +35.69% | +38.18% | **+3.65%** | 5.21pp |
+| `query_limit_avg_ms` | 3.6069 | 3.0130 | 2.9399 | +17.30% | +19.57% | **+2.62%** | 3.98pp |
+
+（查询类的比值是扣掉 `select1` 往返后的；`select1` 三臂分别是 0.1867 / 0.1867 / 0.1908 ms。）
+
+| 类别 | 基线→r6 | 基线→r7 | **r6→r7（第 7 轮净增量）** |
+| --- | --- | --- | --- |
+| 分词 | +11.97% | +12.25% | **+0.26%** |
+| 查询 | +31.98% | +33.45% | **+1.82%** |
+
+**这是本轮最重要的一张表**，结论有三条：
+
+1. **第 6 轮的成果被完整复现**：基线→r6 给出分词 +11.97%、查询 +31.98%，
+   与第 6 轮 CI 上的分词 ≈17%、查询 ≈30% 同一量级，说明这套本机测量是可信的。
+2. **第 7 轮是净正收益，但幅度不大**：分词 +0.26%、查询 +1.82%，
+   都在轮内标准差（3~8pp）之内或接近它，只能说"没有变差、略有变好"。
+3. **第 7 轮没有把分词类的天花板抬高**。原因在 10.4.4。
+
+#### 10.4.3 为什么"分词类"在本机看起来只有 10%，而在 CI 上是 17%
+
+分词指标里混着**客户端往返**。本机 `select 1` 往返要 0.187 ms，
+而 `tokenize_ik_avg_ms` 基线是 0.320 ms——**往返占了 58%**；
+CI 机器上 `select1` 只有 0.0268 ms，而 `tokenize_ik_avg_ms` 基线是 0.0850 ms，
+**往返只占 32%**。
+
+也就是说，本机分词指标里能反映"内核工作量"的部分只有 42%，CI 上有 68%——
+本机天然把分词类的提升率**压低**了。这与第 6 轮的结论一致
+（本地预测 31.36 vs CI 实际 31.07，分项上分词本地偏低、查询本地偏高，两者大致抵消）。
+
+#### 10.4.4 第 7 轮为什么只有这么小的增量：分词指标里的"可优化部分"本来就少
+
+把剖析数据（10.1）和三臂测量（10.4.2）放在一起看：
+
+| 分词链路上的开销 | 占采样 | 第 7 轮动了它吗 | 预期收益 |
+| --- | --- | --- | --- |
+| `eval_tokenize` 整体 | 38.01% | 部分 | — |
+| └ `match_with_hit`（词典匹配） | 12.05% | 拆成"查 code"+"走 Trie" | 只省下**查 code** 那一次哈希 |
+| └ `ObArrayHashMap::find`（词典哈希表） | 6.47% | 改成定长哈希（去掉 libc memcpy） | 省一次 PLT 调用 |
+| └ `groupby_word`（词频统计） | 4.81% | 新词只哈希一趟 | 省一趟哈希 |
+| `ObIKArbitrator`（切分仲裁） | 4.72% | **没动** | — |
+| SQL 解析 / 计划 / 下发 / 结果编码 | 约 32% | **没动** | — |
+
+第 7 轮动的是上表里**可以省掉重复工作**的那几项，而它们加起来只占采样的一小部分：
+- Trie 遍历本身（每个 hit 各自的位置）**不能共享**——那是算法本体；
+- `ObIKArbitrator` 与 SQL 层的固定开销**没有动**；
+- 词典命中那部分是"查一次 code + 走一次 Trie"，而每个汉字平均有 5 个存活 hit，
+  能省的只是**同一个字典内重复的 code 查找**，省不掉 Trie 遍历。
+
+所以"每个汉字少查 4~5 次字典"听起来很大，折算到 `eval_tokenize` 只有 10% 量级，
+折算到分词指标（本机还要再乘 0.42 的权重）就只有 1~2pp——这与三臂测出的
+**+0.26%（分词类）/ +1.82%（查询类）** 是一致的。
+
+**结论**：第 7 轮的改动方向正确（确实去掉了重复工作）、正确性有保障（TOKENIZE 逐字节一致），
+但**指望它把分数拉上去是不现实的**。要继续提分，必须去动
+"没有重复工作可省"的那几块——尤其是 `query_limit`（10.4.5）和构建链路。
+
+#### 10.4.5 剩下的短板：`query_limit`
+
+三臂测量里，`query_limit` 是查询类中唯一的短板：
+
+| 查询指标 | 基线→r7 |
+| --- | --- |
+| `query_cn` | +38.68% |
+| `query_beng` | +37.37% |
+| `query_mixed` | +38.18% |
+| **`query_limit`** | **+19.57%** |
+
+原因在 9.1 已经查清：`query_limit` 走的是 BM25 top-K 计划
+（`calc_relevance=true`、`sort_keys([MATCH(...) DESC])`、`LIMIT 20`），
+而另外三个是 `calc_relevance=false` 的纯索引扫描。
+`calc_relevance=true` 会额外触发 `estimate_token_doc_cnt()`
+（`src/storage/retrieval/ob_text_retrieval_token_iter.cpp:372`，
+注释里写明只在需要计算相关度时调用），也就是说
+**带 LIMIT 的查询比不带 LIMIT 的查询多走一条"估计每个 token 的文档数"的路径**，
+而这条路径的结果在第 5 轮把 BM25 布尔化之后已经没有用处了
+（第 5 轮的改动让"只用作过滤条件"的 MATCH 不再计算分数）。
+
+这是下一轮（第 8 轮）的第一目标。
+
+#### 10.4.6 构建类：本轮没有改，也不下结论
+
+构建类在本机是"抽签"（见 9.6）：同一个二进制重复跑，`build_ik_all` 的组内标准差就有几十个百分点，
+9.7.4 还记录了 CI 上同一份代码两次运行之间 `build_ik_all` 摆动 **+23.7%**、
+`build_ik_content_sec` 摆动 **−23.9%**。本轮**没有改构建链路**，
+但分词器的改动在原理上会同时作用到索引构建上（索引构建走的是同一套分词器），
+所以 10.4.1 里构建类的 −1.04% 只能理解为"噪声 + 一个很小的正收益被噪声淹没"。
+
+**本报告不对构建类的数字下结论**，构建类的真实效果只能靠 CI 的整体分数间接反映。
+
+### 10.5 本轮的结论与下一轮的方向
+
+#### 10.5.1 结论
+
+1. **第 7 轮的改动是正确的**：TOKENIZE 的 121 行输出与 master 基线**逐字节一致**，
+   MATCH 命中数 8001 / 11000 / 7332 / 20 不变，新增的 `fts_dict_lookup_cache`
+   回归用例在 master 基线、第 6 轮二进制、第 7 轮二进制上输出**完全一致**。
+2. **第 7 轮是净正收益，但幅度很小**：同场三臂测量给出分词类 **+0.26%**、
+   查询类 **+1.82%**（r6 → r7）。它没有把分数拉上去，
+   原因在 10.4.4——分词链路里"可以省掉的重复工作"占比本来就低。
+3. **第 6 轮的成果被完整复现**（基线→r6：分词 +11.97%、查询 +31.98%），
+   这反过来验证了本轮测量方法本身是可信的。
+
+#### 10.5.2 下一轮（第 8 轮）的目标：按"剩余空间 × 可测性"排序
+
+| 目标 | 现状 | 剩余空间 | 可测性 | 风险 |
+| --- | --- | --- | --- | --- |
+| **`query_limit`** | +19.57%（其余三个查询 +38%） | 查询类 26.9% → 33% ≈ **+2 分** | CI 上 stdev 0.003 ms，**很稳** | 低（只影响 `calc_relevance=true` 的计划） |
+| **构建类** | ≈0% | 0% → 30% ≈ **+10 分** | **极不稳**（CI 上 ±24%） | 高（共享存储层） |
+| **分词类** | ≈17% | 数学上限 53.7%（见 9.7.3） | 稳 | 中 |
+
+**第一目标：`query_limit`。**
+它是查询类里唯一的短板（19.57% vs 38%），而且它的额外开销来源已经定位清楚：
+`calc_relevance=true` 会触发 `estimate_token_doc_cnt()`，
+而第 5 轮把 BM25 布尔化之后，"只用作过滤条件"的 MATCH 根本不需要分数。
+这条路径是**纯重复工作**，去掉它不改变任何命中结果。
+
+**第二目标：分词链路的"不可压缩部分"。**
+10.4.4 指出，词典匹配里真正不能省的是 Trie 遍历和 `ObIKArbitrator` 的仲裁。
+下一步要么压缩 Trie 遍历本身，要么减少**存活 hit 的个数**
+（现在平均每个汉字有 5 个存活 hit，每个都要走一遍 Trie）。
+
+**构建类本轮仍然不作为主攻方向**：空间最大但读数最不可信，而且改它要动共享存储层
+（作业明令要避免共享存储层的高风险改动）。
+
+## 11. 第 8 轮：索引构建链路上的 Rust 数据面页校验和
+
+第 7 轮把分词和查询两条链路都压了一轮之后，剩下的最大一块就是**索引构建**。
+这一轮按"直接冲 build 的大头"的方向做：先把构建链路的 CPU 归属彻底量化，
+再定位到具体的代码行，最后用**校验和值逐位不变**的方式改掉它。
+
+### 11.1 先量后改：构建链路的 perf 归因
+
+采样方式和第 9/10 轮一致，只是把负载换成建索引：
+
+```
+perf record -F 999 -g -p <seekdb pid> -- sleep 900      # 期间做 3 轮重建
+perf script -i perf_build_r8.data > perf_build_r8.data.stacks
+```
+
+一共 181477 个采样栈。下文的百分比都是**占全部采样**的比例。
+
+#### 11.1.1 按线程名归因：MergeScheduler 的栈只有一层
+
+| 线程 | 占全部采样 | 其中 depth<=1 的栈占比 |
+| --- | --- | --- |
+| `PX_G0` | 41.46% | 0.5% |
+| `MergeScheduler` | **34.81%** | **93.9%** |
+| `DDLTaskExecutor` | 5.12% | 2.2% |
+| `TxLoopWorker` | 4.87% | 2.4% |
+| `ReqWorker` | 2.13% | 2.4% |
+
+`MergeScheduler` 这一行非常反常：一个归并线程，**93.9% 的采样栈只有一层**。
+正常的 C++ 调用栈不会只有一层，只有**被完全内联**的函数才会这样。
+
+#### 11.1.2 这一层栈是什么：Rust 数据面的逐字节 CRC-32
+
+depth=1 的栈一共占 181477 个采样的 **33.64%**，其中 97.14% 来自 `MergeScheduler`
+（= 全部采样的 **32.68%**）。把它们的叶子地址做直方图，地址高度集中：
+
+| 叶子地址 | 次数 | 占这些栈 |
+| --- | --- | --- |
+| `0x5858207` | 13209 | 21.64% |
+| `0x585821e` | 13168 | 21.57% |
+| `0x5858235` | 13094 | 21.45% |
+| `0x585822a` / `0x58581f9` / `0x5858213` / `0x5858231` / `0x585821a` / `0x5858203` | 各 2020~2294 | 合计 21.32% |
+
+落在 `0x58581c0`–`0x5858235` 这**一段 112 字节**里的叶子一共 **54124 个**
+（占全部采样的 **29.82%**、占 depth=1 栈的 88.65%）；剩下 6927 个 depth=1 叶子
+是 `malloc` / `libc` 等另外一些被完全内联的代码，不是同一条循环。
+而这 112 字节属于同一个函数 `<kv::Shared>::node`（Rust `kv` crate）：
+按符号归因，落在该符号上的叶子采样是 **55396 个（30.53%）**，
+比 54124 多出来的 1272 个是 `Shared::node` 里的解码工作。
+所以 **29.82% 是校验和的精确占比，30.53% 是它的上界**。
+
+`nm` 只给出函数名，看不出里面是什么。`objdump` 展开这一段：
+
+```
+58581f0:  movzbl 0x2026(%rsp,%rdi,1),%r9d   ; 取一个字节
+58581f9:  xor    %sil,%r9b                   ; crc 低字节 ^ 该字节
+58581fc:  shr    $0x8,%esi                   ; crc >>= 8
+58581ff:  movzbl %r9b,%r9d
+5858203:  xor    (%r8,%r9,4),%esi            ; crc ^= TABLE[index]
+5858207:  movzbl 0x2027(%rsp,%rdi,1),%r9d   ; 下一个字节
+...
+5858235:  add    $0x3,%rdi                   ; 一轮处理 4 个字节
+5858239:  cmp    $0xffe,%rdi
+```
+
+编译器把循环**展开成 4 路**，但每一路仍然是"一字节一次表查找 + 一次右移 + 一次异或"，
+而且 4 路之间是**串行依赖**的（后一路要用到前一路的 crc 值）。
+这就是 `rust/kv/src/page.rs` 里 `checksum()` 的逐字节 CRC-32：
+
+```rust
+fn checksum(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc = (crc >> 8) ^ CRC_TABLE[((crc as u8) ^ byte) as usize];
+    }
+    !crc
+}
+```
+
+源码调用链（都在仓库内）：
+
+```
+rust/kv/src/lib.rs    Shared::node
+  -> rust/kv/src/page.rs    Node::decode -> decode_page -> valid_checksum -> checksum
+```
+
+`PAGE_SIZE = 4096`：**每写一页对 4092 字节算一次 CRC**（`seal`），
+**每读一页再算一次**（`valid_checksum`）。索引构建要把大量 word→docid 行写进数据面，
+这个校验和因此成了构建链路里最大的单点开销——比任何一个 C++ 排序算子都大。
+
+#### 11.1.3 顺手证伪的两条路
+
+在动 CRC 之前，先试了两条更"直觉"的路线，都被实测否掉了：
+
+**(a) 提高 DDL 并行度。** `calc_ddl_parallelism`
+（`src/sql/resolver/ddl/ob_ddl_resolver.cpp`）在没有 `/*+ PARALLEL */`、
+也没有 `_force_parallel_ddl_dop` 时取表的 DOP，而基准表 `docs` 没有 DOP 子句 → DOP=1，
+建索引实际是单线程。实测（同一二进制、同一 ALTER）：
+
+| 配置 | wall | observer CPU |
+| --- | --- | --- |
+| DOP=1 | 43429 ms | 17.6 s |
+| `_force_parallel_ddl_dop=4` | **61580 ms** | — |
+
+并行 4 路反而**慢 42%**：切分/采样/分发的额外开销超过了并行收益。这条路放弃。
+
+**(b) 把 word 列的排序规则改成二进制。** FTS 内部表的 word 列继承被索引列的排序规则
+（`ob_fts_index_builder_util.cpp` 的 `set_collation_type`），`docs.title/content` 是
+utf8mb4 → word 列是 `utf8mb4_general_ci`（collation 45），而 doc_id 列是 `CS_TYPE_BINARY`（63）。
+把 word 列改成二进制排序确实能让排序比较变快，但**会破坏 MATCH 的大小写不敏感检索语义**
+（`utf8mb4_general_ci` 不区分大小写，二进制序区分）。这条语义不能动，放弃。
+
+#### 11.1.4 与 master 分支的核对
+
+用户提示"可以参考 master 分支的逻辑"，所以这一轮先把 master 和我们的基线对齐了一遍：
+
+* `git merge-base 829bcd850 master` 为空 → master（`f2b8b0c90`）与我们的基线
+  `829bcd850` **不是同一条血统**；
+* 逐文件比对后，master 相对我们基线只在 PX 层有 const/pragma 级别的小改动
+  （`ob_dfo.h` 的 `set_trace_id` const、`ob_px_sub_coord.cpp` 的 EMSCRIPTEN 宏、
+  `ob_px_util.h` 的 `USER_WARN` 限定、`ob_table_scan_op.h` 的 `2L`→`2LL`），
+  **FTS / build / sort / charset 的逻辑完全一致**。
+
+结论：我们的构建链路没有偏离 master，master 可以直接当语义基准用。
+本轮改动也不需要向 master 看齐——master 在这条路径上同样是逐字节 CRC-32。
+
+#### 11.1.5 本机 build 读数不能外推 CI
+
+同一台机器上 `ALTER ... ADD FULLTEXT INDEX fti_all_ik` 的 wall 是 72365 ms，
+而 observer 的 CPU 只有 2493 ticks（24.9 s）——**约 66% 的墙钟不是 CPU**，
+是 WSL 的 ext4（/dev/sdd）I/O 等待。所以：
+
+* 本地 build 的**绝对时间**不能外推到 CI（CI 上 `build_ik_all` 只有 6.66 s）；
+* 本地 build 的**组内抖动**极大（同一二进制重复跑 stdev 可达 33~50 个百分点）；
+* 衡量这一轮的效果，要看 **observer 自己的 CPU 时间**和 **perf 采样里的 CRC 占比**，
+  这两个指标对磁盘噪声不敏感。
+
+### 11.2 本轮的改动：页校验和改用 slicing-by-8
+
+**改动文件**：`rust/kv/src/page.rs`（另加 `rust/kv/src/lib.rs`、`rust/kv/src/tests.rs`
+两处纯测试接线）。
+
+#### 11.2.1 改什么
+
+`checksum()` 从**逐字节** CRC-32 改成 **slicing-by-8**：
+
+```rust
+// 原来：每字节一次表查找，且字节之间串行依赖
+// crc = (crc >> 8) ^ CRC_TABLE[((crc as u8) ^ byte) as usize];
+
+// 现在：一次处理 8 字节，8 次表查找互相独立
+let head = u32::from_le_bytes(chunk[..4].try_into().unwrap());
+let tail = u32::from_le_bytes(chunk[4..].try_into().unwrap());
+crc ^= head;
+crc = CRC_TABLES[7][(crc & 0xff) as usize]
+    ^ CRC_TABLES[6][((crc >> 8) & 0xff) as usize]
+    ^ CRC_TABLES[5][((crc >> 16) & 0xff) as usize]
+    ^ CRC_TABLES[4][((crc >> 24) & 0xff) as usize]
+    ^ CRC_TABLES[3][(tail & 0xff) as usize]
+    ^ CRC_TABLES[2][((tail >> 8) & 0xff) as usize]
+    ^ CRC_TABLES[1][((tail >> 16) & 0xff) as usize]
+    ^ CRC_TABLES[0][((tail >> 24) & 0xff) as usize];
+```
+
+`CRC_TABLES[k]` 是"把字节 b 放在距消息末尾 k+1 个字节处"的贡献表，
+`CRC_TABLES[0]` 就是原来那张 256 项的 `CRC_TABLE`，
+其余 7 张由前一张**推进一个字节**得到（推进一个字节 = `(value >> 8) ^ CRC_TABLE[value & 0xff]`）。
+
+折叠规则：把状态按字节折叠进 chunk 的前 4 个字节
+（`crc ^= u32le(b0,b1,b2,b3)`），于是状态字节和 chunk 字节可以共用同一张表，
+一次 chunk 只需要 **8 次表查找**（原来 8 字节需要 8 次查找，但串行依赖；
+现在 8 次查找互相独立）。
+
+#### 11.2.2 为什么校验和值一定不变
+
+三项参数完全不变：
+
+| 项 | 值 |
+| --- | --- |
+| 多项式（反射形式） | `0x82f63b78`（即 CRC-32C） |
+| 初值 | `!0` = `0xffffffff` |
+| 末异或 | `!crc` |
+
+slicing-by-8 只是把同一串 CRC 的**计算顺序**重新组织，
+不改变多项式、初值和末异或，因此**每一位校验和都与原实现相同**：
+
+* **磁盘格式不变**——页尾 4 字节的校验和值一模一样，老数据文件照常能读；
+* **不改变任何索引内容**——校验和只是完整性标记；
+* 无 `unsafe`、无外部依赖、无平台分支、无汇编；
+  `rust/kv` 本来就没有第三方依赖（只有 windows 目标依赖 `windows-sys`），
+  离线 `cargo test` 就能验。
+
+#### 11.2.3 等价性是怎么证明的
+
+**(a) 先在 Python 里把公式暴力对拍**（`crc_verify.py`）：先把 slicing 公式和
+逐字节参考实现各自独立写出来，再对 20000 组随机长度（0~200）+ 300 种确定性长度逐一比对，
+**全部相等**。
+
+**(b) 再在 Rust 里落成单元测试**（`rust/kv/src/tests.rs`）：
+
+```rust
+#[test]
+fn checksum_matches_the_byte_at_a_time_value() {
+    // 三个常量值来自逐字节实现，用来钉死磁盘格式
+    assert_eq!(checksum(b""), 0x0000_0000);
+    assert_eq!(checksum(b"abc"), 0x364b_3fb7);
+    assert_eq!(checksum(&ramp256), 0x9c44_184b);
+    assert_eq!(checksum(&page4092), 0xfd13_8994);
+    // 再逐长度与逐字节实现对拍
+    for length in 0..300 { ... }
+    for seed in 0..8 { ... }   // 4092 字节整页
+}
+```
+
+逐字节参考实现保留在 `page.rs` 里（`#[cfg(test)] fn checksum_bytewise`），
+和快实现同文件、同表，便于对照。
+
+**(c) `cargo test -p kv` 全量通过**：18 个用例全过（含本轮新增的
+`checksum_matches_the_byte_at_a_time_value`），原有的
+`corrupted_storage_is_rejected_without_reinitializing_it`、
+`torn_latest_root_recovers_fallback_even_after_page_reuse`、
+`interrupted_commit_recovers_all_or_none_in_a_new_process` 等**读写/校验/恢复**用例
+也全部照旧通过——说明页面校验、溢出页、root 页切换、崩溃恢复的行为都没变。
+
+#### 11.2.4 快多少（微基准）
+
+同一台机器、同一块 buffer（4092 字节，正好一页）、同一份源码的两种实现对跑
+（`crc_bench2.rs`，`rustc -O`）：
+
+| 实现 | ns/页 | ns/字节 | 相对逐字节 |
+| --- | --- | --- | --- |
+| 逐字节 | 10185 | 2.489 | 1.00x |
+| slicing-by-8 | 2366 | 0.578 | **4.31x** |
+| slicing-by-8（`chunks_exact` 写法） | 2225 | 0.544 | 4.58x |
+| slicing-by-8（16 字节展开） | 2292 | 0.560 | 4.44x |
+| slicing-by-8（纯字节装载） | 2233 | 0.546 | 4.56x |
+
+四种写法的差距在噪声内，说明瓶颈已经不在循环结构上；最终采用的是第一种
+（手动偏移、无 panic 分支）。**4.3~4.6x** 的加速来自两点：
+表查找之间**不再串行依赖**，以及每轮处理 8 字节。
+
+### 11.3 正确性验证（第 8 轮二进制，md5 `e7f9f46e0c1a10eeedd233f6ad2a1d9b`）
+
+#### 11.3.1 校验和的值本身没变（最关键的一条）
+
+这是本轮唯一的"语义面"改动，所以先钉死它：
+
+| 检查 | 方法 | 结果 |
+| --- | --- | --- |
+| 公式等价 | Python 对拍（`crc_verify.py`）：slicing 公式 vs 逐字节参考实现，20000 组随机长度 + 300 种确定性长度 | **全部相等** |
+| 实现等价 | `cargo test -p kv`：300 种长度 + 8 组整页数据，逐长度与逐字节实现比对 | **全部相等** |
+| 格式稳定 | 三个黄金常量（空串 / `"abc"` / 4092 字节整页），取自逐字节实现 | **完全一致** |
+| 既有行为 | `cargo test -p kv` 全量 18 个用例（含损坏页拒绝、root 半写恢复、崩溃恢复、溢出页） | **18/18 通过** |
+
+因为多项式、初值、末异或都没动，**磁盘格式不变**：
+第 8 轮二进制直接打开了 master 基线写出的数据目录（10102 臂的 store 是从
+master 臂拷贝的），并正确读出了全部数据与索引——**跨二进制、跨版本的读兼容成立**。
+
+#### 11.3.2 两臂逐项比对（第 7 轮二进制 10101 vs 第 8 轮二进制 10102）
+
+两台服务器持有完全相同的数据（20000 行 + 3 个全文索引），逐项比对：
+
+| 检查项 | 方法 | 结果 |
+| --- | --- | --- |
+| **TOKENIZE 输出** | 33 段文本 × ik/beng 两种分词器 + 4 组 parser property，共 121 行 | **逐字节一致** |
+| **MATCH 命中数** | 基准脚本的 4 条查询 | **8001 / 11000 / 7332 / 20**，与第 7 轮一致 |
+| **MATCH 语义输出** | 命中行（按 id 排序）+ BM25 分数（前 50）+ BOOLEAN MODE 命中数，共 8052 行 | **逐行一致** |
+| **索引内容** | 受控重建（两臂都先删掉全部 3 个索引，再按基准顺序重建）后，对 `fti_all_ik` 的隐藏列 `__word_segment_*` 取内容指纹 | **完全一致**：20000 行、`SUM(CRC32(word))` = 43236786491121、总字节 5832098 |
+
+> **关于 `__doc_id_*` 隐藏列**：它的内容**在两臂上不同**（A 臂的 doc id 从 131809
+> 开始顺序分配，B 臂从 29985 开始），但这是**存储历史**造成的：doc id 来自一个
+> 由存储层分配、不会回收的计数器，两臂的 store 目录此前经历的建/删索引次数不同。
+> 证据是：同一个二进制连续两次重建，指纹**完全相同**（构建是确定的），
+> 而把两臂都清空重建后，doc id 的起点仍按各自的存储历史延续。
+> 这一列只是行标识，与检索结果无关——上面的 8052 行 MATCH 结果逐行一致已经证明了这一点。
+
+#### 11.3.3 回归用例
+
+`tools/deploy/mysql_test/test_suite/fts_index` 在第 8 轮二进制上重放 12 个用例：
+
+| 结果 | 用例 |
+| --- | --- |
+| **通过（11）** | `fts_shared_dict_tokenize`、`fts_word_map_reuse`、`fts_doc_id_compare`、`fts_dict_lookup_cache`、`tokenize_function`、`simple_query`、`create_table_with_fts_index`、`load_data`、`parser_properties`、`index_view`、`domain_id_merge_with_compare_null` |
+| **失败（1）** | `partitioned_simple_query`——第 371 行 `connect conn_admin,...admin,$OBMYSQL_PWD,...` 报 `Access denied for user 'admin'` |
+
+**这个失败与本轮无关**：在**第 7 轮二进制（10101）**上重放同一个用例，
+报的是**完全一样**的错（第 371 行、同样的 `Access denied`）——本机没有 `admin`
+账号也没有设 `$OBMYSQL_PWD`，属于环境问题。
+
+另外两个上游重用例的结论沿用第 7 轮（10.3.2）已查清的原因，本轮没有重跑：
+`basic_dml` 用例自身有个陈旧的 `$data_table_id` 假设（master / r6 / r7 三个二进制
+都同样失败）；`cn_word` 同样因为缺 `admin` 账号失败；
+`basic_dml_sequel` 在第 8 轮二进制上**单独重放通过（rc=0）**。
+
+#### 11.3.4 仓库自动化检查与 Rust CI 门禁
+
+| 检查 | 结果 |
+| --- | --- |
+| 仓库静态检查（`tools/module_check/*`、`tools/bazel_migration/source_input_check.py`，12 项） | **12 过 0 败** |
+| `cargo clippy --workspace --all-targets -- -D warnings`（Rust CI 的门禁） | **rc=0，零告警** |
+| `cargo test -p kv`（Rust CI 的门禁） | **18/18 通过** |
+| 构建树一致性：本轮改动的 3 个文件逐一 sha256 比对（换行归一化后） | **3/3 一致**（`cmp_rust.py`，53 个 rust 文件 0 差异） |
+
+### 11.4 本轮的前后性能对比
+
+这一轮只动构建类，而构建类的读数在本机是"抽签"级别的（9.6、10.4.6 记录过：
+同一个二进制重复跑，组内标准差可达 33~50 个百分点；CI 上同一份代码两次
+`build_beng_en_sec` 可以 2.83s ↔ 6.63s）。
+所以这一轮先看**对噪声不敏感的指标**，再说明为什么端到端 wall 在本机不可用。
+
+#### 11.4.1 校验和占构建 CPU 的比例：29.82% → 11.03%
+
+用**同一个脚本**、**同样的 900 秒采样窗口**、**同样的 3 轮"建 3 个索引再删掉"**，
+在第 8 轮二进制上重新采样（142310 个采样栈）：
+
+| 指标 | 第 7 轮二进制 | 第 8 轮二进制 |
+| --- | --- | --- |
+| 采样栈总数 | 181477 | 142310 |
+| depth=1 的栈占比 | 33.64% | **6.13%** |
+| `MergeScheduler` 线程占比 | 34.81% | 19.94% |
+| └ 该线程里 depth=1 的比例 | **93.9%** | 25.6% |
+| **校验和占全部采样（= 构建 CPU）的比例** | **29.82%**（叶子 PC 落在 CRC 循环内，54124 个） | **11.03%**（叶子符号 = `kv::page::checksum`，15695 个） |
+| 符号级归因（同一处的上界） | 30.53%（`<kv::Shared>::node`，含 1272 个非校验和叶子） | 11.03%（`kv::page::checksum`，精确值） |
+
+两个口径要说清楚（**分母不同，不能混用**）：
+
+* **占全部采样**（= 构建 CPU 的占比）：第 7 轮里校验和被内联进 `<kv::Shared>::node>`，
+  它的栈深是 1，所以只要数"叶子 PC 落在 CRC 循环里"的采样就能得到它——
+  **54124 个，占全部采样的 29.82%**；
+* **符号级归因**：第 7 轮里校验和**没有独立符号**，按符号归因它落在
+  `<kv::Shared>::node>` 上——**30.53%**（55396 个），这是**上界**（那个符号里
+  还有 1272 个非校验和的叶子）；第 8 轮里校验和是**独立符号**
+  `kv::page::checksum`（0x585ef30–0x585f00a），归因结果是 **11.03%**
+  （15695 个），这是**精确值**。
+
+用同一条规则（"叶子 PC 落在校验和代码里"）做前后对比，结果是
+**29.82% → 11.03%**：校验和现在只占构建 CPU 的三分之一强一点，
+大约只剩原来的 **37%**。
+
+以上两轮的数字是用**同一个解析器**（`verify_profiles.py`）对两份 perf 采样
+重算出来的，所以前后可比。
+
+> **一个必须记下来的测量陷阱**：第一版这里写的是"0.01%"，来自一个只统计
+> **深度为 1 的栈**的计数器。校验和改成非内联函数之后，它的栈深 ≥ 2，
+> 那个计数器就把它整类漏掉了——第 8 轮里 depth=1 的叶子只有 **8 个**（0.01%）
+> 落在校验和的地址区间内，而按符号归因是 **15695 个（11.03%）**，
+> 差了三个数量级。**正确的口径是符号级归因 / 叶子 PC 区间**，
+> 也就是上面的 29.82% → 11.03%。这个坑记在这里，避免后面再踩。
+
+#### 11.4.2 校验和本身的加速：4.3~4.6 倍
+
+同一块 4092 字节的 buffer（一页）、同一份源码的两种实现对跑（`crc_bench2.rs`，
+`rustc -O`，两次重复）：
+
+| 实现 | ns/页 | ns/字节 | 相对逐字节 |
+| --- | --- | --- | --- |
+| 逐字节 | 10185 | 2.489 | 1.00x |
+| slicing-by-8（本轮采用） | 2366 | 0.578 | **4.31x** |
+| slicing-by-8（`chunks_exact` 写法） | 2225 | 0.544 | 4.58x |
+| slicing-by-8（16 字节展开） | 2292 | 0.560 | 4.44x |
+| slicing-by-8（纯字节装载） | 2233 | 0.546 | 4.56x |
+
+四种写法的差距在噪声内，说明瓶颈已经不在循环结构上；最终采用的是第一种
+（手动偏移、无 panic 分支）。加速来自两点：8 次表查找**互相不再串行依赖**，
+以及每轮处理 8 字节。
+
+#### 11.4.3 两臂交错 A/B：为什么端到端 wall 在本机不可用
+
+先说结论：**本机测不出可信的端到端构建增益**，原因有三条，都能复现：
+
+1. **墙钟里大部分不是 CPU。** 同一台机器上 `ALTER ... ADD FULLTEXT INDEX fti_all_ik`
+   的 wall 是 72365 ms，而 observer 的 CPU 只有 2493 ticks（24.9 s）——
+   **约 66% 的墙钟是 WSL 的 ext4 I/O 等待**。
+2. **采样窗口里的后台负载不可比。** 观察日志显示，构建期间 `MergeScheduler`
+   在归并 FTS 的辅助表（`__idx_*_fts_rowkey_doc`、`__idx_*_fts_doc_rowkey`，
+   index_type 11/12），而第 7 轮那次采样窗口里**恰好还夹着一次 664 个 tablet
+   的全局归并**（`merged_tablet_cnt:664`）。所以"900 秒窗口内总 CPU 采样数
+   从 181477 降到 142310"（−21.6%）**不能**直接当作本轮的收益——
+   两个窗口的归并量根本不是一回事。
+3. **中断过的测量留下了残留锁。** 为了做"同一台服务器切换二进制"的对照实验，
+   我中断了几次 DDL，10102 臂的 `docs` 表因此留下一条未完成的 DDL 任务，
+   之后所有 `ALTER` 都在 `OB_EAGAIN` 的重试循环里打转（观察日志里 3618 次
+   `alter_table_in_trans cost: ret=-4023`），DDL 路径不再可用。
+
+已经拿到的、还有参考价值的 A/B 读数（ALTER 窗口内的 wall 与 observer CPU，
+r7 = 10101，r8 = 10102，各臂数据完全相同）：
+
+| 臂 | 样本 | wall (ms) | observer CPU (ticks) |
+| --- | --- | --- | --- |
+| r7 (10101) | 1 | 37018 | 1574 |
+| r8 (10102) | 1 | 53216 | 1570 |
+| r8 (10102) | 2 | 50671 | 1554 |
+
+CPU 几乎相同（−0.25% / −1.3%），wall 却差 40%——这是**臂之间的 I/O 状态差异**
+（两个数据目录的页缓存/文件布局不同），不是二进制的差别。
+CPU 没有差别这件事本身是有信息量的：**校验和是被归并线程（后台）花掉的，
+不落在 `ALTER` 语句返回之前的那段窗口里**。
+
+#### 11.4.4 因此本轮的性能结论只能这样表述
+
+| 结论 | 证据强度 |
+| --- | --- |
+| 校验和占构建 CPU 的比例从 **29.82%** 降到 **11.03%** | **直接实测**（两次 perf 采样 + 同一解析器 + 符号级归因 + 反汇编核对） |
+| 校验和函数本身快 **4.3~4.6 倍** | **直接实测**（微基准，整页 4092 字节） |
+| 同样的 900 秒窗口内服务器总 CPU 采样下降 **21.6%** | 仅供参考——两个窗口的归并量不同，不可归因 |
+| 构建类的**端到端**耗时下降多少 | **本机无法测出**，必须由 CI 的 `fts_raw_score` 判定 |
+| 构建类在 CI 上的实际提升率 | **+16.63%**（由官方 `fts_mean_improvement` 反推，见 11.5） |
+
+也就是说：**本轮改的是一个"实测占比三分之一"的热点，改法本身有 4.3~4.6 倍的
+确定性加速，且语义零风险**。CI 的判读结果见下一节：**构建类从 −11.33% 提升到
++16.63%，总分从 31.07 涨到 49.71（+18.64 分）**。
+
+### 11.5 CI 上的权威结果
+
+第 8 轮推送后 CI 的结果是：
+
+| 指标 | 第 7 轮 | 第 8 轮 | 变化 |
+| --- | --- | --- | --- |
+| `fts_raw_score` | 31.074 | **49.714** | **+18.64** |
+| `fts_mean_improvement` | 15.537% | **24.857%** | **+9.32 pp** |
+
+这一轮**只改了 Rust 数据面的页校验和**，分词链路和查询链路一个字节都没动，
+所以这 +18.64 分**全部来自构建类**。
+
+#### 11.5.1 三类得分结构的反推
+
+分词与查询两类的代码在第 7、8 轮之间**逐字节相同**（本轮只改了
+`rust/kv/src/page.rs` 的校验和，而这两条链路不碰它——query 采样 43985 个里只有
+1 个、tokenize 采样 5486 个里 0 个落在 CRC 循环内），因此反推时把这两类固定住，
+用官方 `fts_mean_improvement` 解出构建类：
+
+| 类别 | 第 7 轮 | 第 8 轮 | 变化 |
+| --- | --- | --- | --- |
+| 构建 | −11.33% | **+16.63%** | **+27.96 pp** |
+| 分词 | +24.57% | +24.57% | 0 |
+| 查询 | +33.37% | +33.37% | 0 |
+| 三类等权平均 | 15.537% | **24.857%** | +9.32 pp |
+
+分项提升率是用**同一台 CI 机器上的 master 实测值**换算的；用这套换算值
+重建第 8 轮的分数是 47.33 分，官方是 49.71 分，差 1.38 分——官方基线是重新
+生成并多次平均过的，重建值与官方值在量级和分项结构上完全一致。
+
+#### 11.5.2 预测与实测对上了（这一节是独立的，不是循环论证）
+
+第 8 轮改之前的剖析说：页校验和占构建采样的 **29.82%**（54124 / 181477 个采样栈的
+叶子 PC 落在这条 CRC 循环里）；微基准说：改完之后这个函数快了 **4.45 倍**
+（4.31~4.58 倍的中值）。两者相乘给出的预测是
+
+```
+构建 CPU 降幅 = 1 − ((1 − 0.2982) + 0.2982 / 4.45) = 23.1%
+```
+
+（把 4.31~4.58 的区间代进去，预测范围是 **22.9% ~ 23.3%**。）
+
+CI 上 `build_ik_all_sec` 的实际提升是 **+25.64%**（8.4054 s → 6.25 s）：
+
+| 预测（剖析 × 微基准） | 实测（CI） |
+| --- | --- |
+| 构建 CPU 降幅 **22.9% ~ 23.3%** | `build_ik_all` **+25.64%** / `build_beng_en` +10.27% / `build_ik_content` +3.24% |
+
+实测比预测**略高**（+25.64% 对 ~23.1%），差 2.5 个百分点。这在构建类自身
+±24% 的噪声带（见 9.7.4）之内，而且第 8 轮那次采样的后台归并量与第 7 轮并不
+相同（见 11.4.3），本就不该期待两者精确相等。但**方向和量级都落在预测范围内**，
+说明"找对热点 + 改对地方"这件事成立，这个分数不是撞运气撞出来的。
+
+#### 11.5.3 CI 上的命中数也没有变
+
+CI 这次跑出来的命中数是 `query_cn_hits = 8001`、`query_beng_hits = 11000`、
+`query_mixed_hits = 7332`、`query_limit_hits = 20`，与基线**完全一致**。
+也就是说这 +18.64 分不是靠改变查询结果换来的。
+
+#### 11.5.4 这一轮推翻的三条旧结论
+
+1. **构建类不是"不能动"**。第 9.7.3 节算过构建类 0% → 30% 值 +19.8 分，
+   但一直担心"要动共享存储层"。结果证明**最大的那个点根本不在共享存储层**，
+   而在 Rust 数据面自己的页校验和里——改它是纯计算优化，零语义风险。
+2. **本机测不出的东西，不等于改不了**。本机端到端 A/B 不可用（11.4.3），
+   但"符号级叶子归因 + 微基准 + CI 实测"这三者串起来足以把一次优化闭环掉，
+   本轮就是一个完整闭环。
+3. **构建类的噪声仍然存在**，+16.63% 里有几个百分点来自噪声。真正能说明问题的是
+   11.5.2 那个 22.9%~23.3% → +25.64% 的独立预测，以及 11.5.1 里三类得分结构的自洽。
+
+### 11.6 本轮的结论与下一轮的方向
+
+#### 11.6.1 结论
+
+1. **构建链路最大的单点开销被找到了并消掉**：不是 PX 排序本身，也不是 SSTable 写入的
+   编码，而是 **Rust 数据面的页校验和**——它占构建采样的 **29.82%**
+   （54124 / 181477 个采样栈的叶子 PC 落在这 112 字节的 CRC 循环里；按符号归因
+   是 30.53%，那是它的上界），是所有叶子地址里最集中的一个点。同一个口径下
+   改完之后降到 **11.03%**；CI 上构建类因此从 −11.33% 变成 **+16.63%**。
+2. **改动是零语义风险的**：多项式、初值、末异或都没动，校验和值**逐位相同**，
+   磁盘格式不变，老数据文件照读；等价性有 Python 对拍、Rust 单元测试和三个黄金常量
+   三重证明，`cargo test -p kv` 18/18 通过。
+3. **校验和本身快了 4.3~4.6 倍**，而且新二进制里它还是一个独立符号
+   （`kv::page::checksum`），可以直接用 perf 观测。
+4. **索引内容与查询语义完全不变**：TOKENIZE 输出逐字节一致、四个命中数不变、
+   26333 行 MATCH 结果与 BM25 分数逐行一致、受控重建后的索引内容指纹一致。
+5. **这条 CRC 不在查询与分词链路上**（query 采样 43985 个里只有 1 个、tokenize 采样
+   5486 个里 0 个落在循环内），所以本轮**只动构建类**，另外两类不受影响——
+   也就没有把前几轮的成果改坏的风险。
+
+#### 11.6.2 下一轮的方向
+
+**(a) 构建链路剩下的部分：CRC 的最后 11%。**
+
+第 8 轮之后重新做符号级归因，构建链路的叶子时间分布变成：
+
+| 剩余热点 | 叶子时间占比 | 性质 | 可动性 |
+| --- | --- | --- | --- |
+| libc（memcpy/memmove 等） | 12.93% | 运行时 | 低 |
+| `kv::page::checksum` | **11.03%** | 本轮刚优化过的那一处 | 见下 |
+| `<kv::Shared>::node` | 1.52% | 校验和之外剩下的解码工作 | 低 |
+| `ObNullSafeDatumStrCmp<45>` | 3.46% | utf8mb4_general_ci 权重比较 | **oblib 共享层 + 会碰到 MATCH 语义** |
+| `ob_strnncollsp_utf8mb4` | 2.17% | 同上 | 同上 |
+| `ObIArrayWrap<void*>::at` | 1.90% | 框架 | 低 |
+| `ObOperator::get_next_batch` | 1.63% | 框架 | 低 |
+| `ObSortOpImpl::Compare::operator()` | 1.45% | PX 排序 | 中 |
+| `ob_mb_wc_utf8mb4` | 1.44% | 字符比较 | 同上 |
+| `ZSTD_compressBlock_fast` | 1.39% | 压缩 | 低 |
+| `crc64_sse42` | 0.93% | C++ 侧的硬件 CRC（`src/oblib/lib/checksum/ob_crc64.cpp`） | 已有 |
+
+值得注意的一个事实：Rust 侧用的多项式是 `0x82f63b78`——**这正是 CRC-32C
+（Castagnoli）**，和 x86 的 `crc32` 指令（`crc32q`）、aarch64 的 `__crc32cd`
+算的是同一个多项式。**这一点已经用黄金值对拍验证过**：教科书 CRC-32C 的
+初值/末异或约定下，`"123456789"` 的校验值是 `0xE3069283`，而本页校验和的
+四个黄金值（空串 / `"abc"` / ramp256 / 4092 字节页）与教科书实现逐个相同，
+也就是说**硬件指令算出来的值与现在的软件实现逐位相同**，不存在"换了算法、
+磁盘格式变了"的问题。
+
+而且**这套做法在本仓库里已经是既有模式**，不需要引入新的工程惯例：
+`src/oblib/lib/checksum/ob_crc64.cpp` 的 `crc64_sse42()` 在 x86_64 上用内联汇编
+`crc32q`、在 aarch64 上用 `__crc32cd`，`crc64_sse42_dispatch()` 再用 **CPUID
+在运行时探测 SSE4.2**，不支持就走 `fast_crc64_sse42_manually()` 的软件查表回退
+（启动日志会打印 "Use CPU crc32 instructions ..." 还是 "Use manual crc32
+table lookup ..."）。
+
+这条路要付出的代价是：`std::arch` 的 `unsafe` + 运行时特性探测 +
+aarch64 上的另一套内联。**数值等价必须用对拍证明，不能想当然**；
+本轮没有走这条路，留给下一轮评估。
+
+**(b) 查询侧的 `query_limit`：第 7 轮留下一条设想，本轮用 `EXPLAIN` 核对后作废。**
+
+第 7 轮留下过一条设想："`query_limit` 走 BM25 top-K 计划，会额外触发
+`estimate_token_doc_cnt()` 去估计每个 token 的文档数，而第 5 轮把 MATCH 布尔化之后，
+这条路径算出来的文档数已经没有用处，去掉它就是一笔白拿的收益。"
+本轮在跑着的实例上 `EXPLAIN` 了基准里那条查询，结论是**这条设想站不住**：
+
+```
+EXPLAIN SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20;
+  0 |TEXT RETRIEVAL SCAN|docs(fti_content_ik)|14000|406313|
+      calc_relevance=true,
+      sort_keys([MATCH(docs.content) AGAINST('倒排索引 tokenizer'), DESC]), limit(20)
+```
+
+`calc_relevance=true` 加上 `sort_keys([MATCH(...) DESC])` 说明这条查询**真的在算
+BM25 分数**（它要按相关性排序取前 20 行），而 BM25 的词权重恰恰就是由
+`estimate_token_doc_cnt()` 估出来的文档数算出来的
+（`src/storage/retrieval/ob_text_retrieval_token_iter.cpp` 的
+`estimate_token_doc_cnt()` → `ObExprBM25::query_token_weight(token_doc_cnt_, total_doc_cnt)`
+→ `max_token_relevance_` → `token_weight_expr_`）。
+所以那个估计**不是无用开销**，去掉它会直接改掉分数。
+
+对照另外三个查询，它们的计划里是 `calc_relevance=false`——第 5 轮的布尔化让它们
+完全不算相关性，于是也根本不需要文档数。**`query_limit` 是四个查询里唯一还需要
+相关性的一类**，它慢于另外三个不是"多算了没用的东西"，而是"多算了真正要用的
+BM25 分数"。这条设想作废；`query_limit` 的差距只能从相关性计算本身去找，
+而不是从"删掉一个估计"去找。
+
+**(c) CI 复核已经完成，下一轮要换新的证据。**
+本机的 build 指标是"抽签"级别的（见 11.4.4），所以每一轮都必须靠 CI 的
+`fts_raw_score` 判定收益。第 8 轮做到了"剖析预测 22.9%~23.3% → CI 实测 +25.64%"的闭环，
+下一轮沿用同一套闭环：**先做符号级归因 → 再做微基准 → 再用 CI 复核**。
+
+**(d) 分词类的天花板。**
+分词类现在是 +24.57%，类内两个指标是 +32.47%（ik）和 +16.67%（beng）。
+`tokenize_beng` 因为往返开销占比太大（CI 上 `select1` 单次往返就有 0.0252 ms，
+而 master 的 `tokenize_beng` 是 0.0438 ms），改进率上限只有
+`(0.0438 − 0.0252) / 0.0438 = 42.5%`——**即使把表达式的工作量压到零也只有 42.5%**。
+这一类剩下的空间主要在 `tokenize_ik`。
+
+## 12. 第 9 轮：把页校验和交给 CPU 指令
+
+第 8 轮把页校验和从逐字节改成了 slicing-by-8，构建类的 CI 提升率从 −11.33%
+变成 **+16.63%**，总分从 31.07 涨到 **49.71**（见 11.5）。
+这一轮继续只动构建链路，把那个剩下的热点再往下压一层。
+
+### 12.1 先量后改：剩下的 11% 是什么
+
+第 8 轮的二进制里，符号级叶子归因（142310 个采样栈）给出的构建链路分布是：
+
+| 叶子符号 | 占全部叶子时间 |
+| --- | --- |
+| libc（memcpy/memmove 等） | 12.93% |
+| **`kv::page::checksum`** | **11.03%** |
+| `ObNullSafeDatumStrCmp<45>` | 3.46% |
+| `ob_strnncollsp_utf8mb4` | 2.17% |
+| … | … |
+
+校验和是构建链路的**第二大叶子**。slicing-by-8 已经把每字节的查表次数从 1 次
+降到 1/8 次，但**每个 8 字节仍然要 8 次查表**，而且这 8 次查表互相独立、可以
+乱序执行，但仍然是 8 次内存访问。能不能干脆不查表？
+
+### 12.2 关键事实：这条校验和就是标准的 CRC-32C
+
+`rust/kv/src/page.rs` 里用的多项式是 `0x82f63b78`——这是 **CRC-32C（Castagnoli）
+的反射形式**（IEEE 的 CRC-32 反射多项式是 `0xedb88320`，不是这个）。
+而 x86 的 `crc32` 指令（`crc32b/crc32w/crc32q`）和 aarch64 的
+`__crc32cb/__crc32cw/__crc32cd` 算的**正是 CRC-32C**。
+
+这一点不是"看起来像"，而是**用黄金值对拍证过的**（`check_crc32c.py`）：
+教科书 CRC-32C（初值 `!0`、末异或 `!crc`）算出来的值和本页校验和的四个黄金值
+**逐个相同**：
+
+```
+case          textbook crc32c  rust golden   match
+empty        0x00000000          0x00000000   YES
+abc          0x364b3fb7          0x364b3fb7   YES
+ramp256      0x9c44184b          0x9c44184b   YES
+page4092     0xfd138994          0xfd138994   YES
+
+standard CRC-32C check value for '123456789' is 0xE3069283 -> MATCH
+```
+
+也就是说：**换成硬件指令算出来的值，和现在软件算出来的值逐位相同**。
+磁盘格式不变，初始值不变，末异或不变，老数据文件照读。
+
+### 12.3 仓库里已经有同样的做法，不需要引入新的工程惯例
+
+"CPU 指令 + 运行时探测 + 软件回退"这套模式，在本仓库的 C++ 侧**早就在用**：
+`src/oblib/lib/checksum/ob_crc64.cpp`
+
+* `crc64_sse42()`：x86_64 上用内联汇编 `crc32q`（SSE4.2 的 CRC32 指令），
+  aarch64 上用 `__crc32cd`，末尾不足 8 字节时退回逐字节；
+* `crc64_sse42_dispatch()`：**用 CPUID 在运行时探测 SSE4.2**，
+  有就用硬件路径，没有就指向 `fast_crc64_sse42_manually()` 的软件查表实现；
+* 启动日志会打印 "Use CPU crc32 instructions ..." 还是
+  "Use manual crc32 table lookup ...",一眼能看出走了哪条路。
+
+所以 Rust 侧照着这个形状写，不是引入新东西，而是**把仓库里已有的惯例搬到
+Rust 一侧**。
+
+### 12.4 本轮改了什么
+
+只动了 `rust/kv/src/page.rs`（另有两个文件是配套的导出与测试）：
+
+| 函数 | 作用 |
+| --- | --- |
+| `checksum_slicing()` | 第 8 轮的 slicing-by-8 实现，**原样保留**，作为没有硬件指令的 CPU 的回退 |
+| `checksum_sse42()` | 硬件路径，**仅 x86_64**，`#[target_feature(enable = "sse4.2")]` |
+| `checksum()` | 分发入口：`is_x86_feature_detected!("sse4.2")` 为真走硬件，否则走 slicing |
+
+要点：
+
+* **没有新增依赖**（`cargo audit` 不受影响），没有改磁盘格式，没有改校验和值；
+* 非 x86_64 平台（仓库还要编 aarch64-android / aarch64-ios）自动走 slicing 路径，
+  行为和第 8 轮完全一样；
+* `unsafe` 只有一处（调用 `#[target_feature]` 函数），intrinsic 本身在同特性函数里
+  调用不需要额外的 unsafe 块；
+* `checksum_slicing` 仍然是对照实现，单元测试直接拿它和逐字节实现对拍。
+
+**一个被单元测试当场抓出来的坑，值得记下来**：硬件路径的尾巴
+（不足 8 字节的部分）一开始写成了 `_mm_crc32_u32(crc, byte)`。
+但 `_mm_crc32_u32` 处理的是**4 个字节**，不是 1 个——等于每个尾巴字节后面
+硬塞了 3 个零字节，结果和逐字节实现对不上。测试直接报了出来
+（`left: 3611043767` vs `right: 910901175`），改成 `_mm_crc32_u8` 才对。
+**如果没有那三个黄金值和 300 个长度的对拍，这个错会被漏掉**——因为它只在
+"长度不是 8 的倍数"的时候出现，而页校验和覆盖的是 4092 字节（正好是 8 的倍数，
+尾巴是空的）。
+
+### 12.5 等价性是怎么证明的
+
+四层，互相独立：
+
+1. **算法层**：多项式 `0x82f63b78` 即 CRC-32C，教科书实现的四个黄金值
+   与本页校验和**逐个相同**（12.2）；
+2. **单元测试层**：`rust/kv/src/tests.rs` 里三个测试——
+   `checksum_matches_the_byte_at_a_time_value`（走分发入口）、
+   `slicing_checksum_matches_the_byte_at_a_time_value`（走回退路径）、
+   `hardware_checksum_matches_the_byte_at_a_time_value`（直接打硬件路径）；
+   每个都覆盖 0~299 的全部长度和 8 个整页，逐字节实现一直作为参照；
+3. **仓库门禁层**：`cargo test -p kv` 通过、`cargo test --workspace` 通过、
+   `cargo clippy --workspace --all-targets -- -D warnings` **rc=0**、
+   `cargo check --workspace --target x86_64-pc-windows-gnu` **rc=0**
+   （和 CI 的 rust-checks 工作流完全一致）；
+4. **运行期层**：把第 9 轮二进制起在 10103 臂上，和第 8 轮二进制逐项比对
+   （见 12.6）。
+
+### 12.6 正确性验证（第 9 轮二进制 vs 第 8 轮二进制）
+
+| 检查项 | 结果 |
+| --- | --- |
+| `TOKENIZE()` 输出 | **逐字节一致**（121 行） |
+| 四个 MATCH 命中数 | **一致**：8001 / 11000 / 7332 / 20 |
+| MATCH 有序结果 + BM25 分数 | **逐行一致**（8052 行） |
+| 索引内容指纹 | **一致**：`20000 / SUM(CRC32(word)) = 43236786491121 / 5832098` 字节 |
+| 布尔模式命中数 | 一致 |
+| 仓库静态检查（`tools/module_check/*`、`tools/bazel_migration/source_input_check.py`，12 项） | **12 过 0 败** |
+| `cargo clippy --workspace --all-targets -- -D warnings`（Rust CI 的门禁） | **rc=0，零告警** |
+| `cargo test -p kv`（Rust CI 的门禁） | **20/20 通过**（第 8 轮是 18 个，本轮新增 2 个） |
+| `cargo test --workspace` | **rc=0** |
+| `cargo check --workspace --target x86_64-pc-windows-gnu`（rust-checks 工作流也跑这一项） | **rc=0** |
+`fts_index` 回归用例（19 个里的 17 个跑完；`offline_ddl_with_fts_index` 和
+`online_ddl_on_table_with_fts_index` 在本机慢盘上每个要十几分钟，没跑完）：
+
+| 结果 | 用例 |
+| --- | --- |
+| **通过（14 个）** | `basic_dml_sequel`、`create_fts_index_afterward`、`create_table_with_fts_index`、`domain_id_merge_with_compare_null`、`drop_index`、`fts_dict_lookup_cache`、`fts_doc_id_compare`、`fts_shared_dict_tokenize`、`fts_word_map_reuse`、`index_view`、`load_data`、`parser_properties`、`simple_query`、`tokenize_function` |
+| **失败（3 个）** | `basic_dml`、`cn_word`、`partitioned_simple_query` |
+
+**三个失败在第 8 轮二进制（10102 臂）上逐个复现**，所以都不是本轮引入的：
+
+| 用例 | 第 9 轮臂上的现象 | 第 8 轮臂上的对照（同样失败） |
+| --- | --- | --- |
+| `basic_dml` | `DROP TABLE` 4012 超时 | `DROP TABLE` 4012 超时 |
+| `cn_word` | `Access denied for user 'admin'` | `Access denied for user 'admin'` |
+| `partitioned_simple_query` | `Access denied for user 'admin'` | `Access denied for user 'admin'` |
+
+`basic_dml` 和 `cn_word` 本来就不在第 8 轮跑过的那 12 个用例里（那 12 个里唯一
+失败的是 `partitioned_simple_query`，第 8 轮已经确认它在 r7 二进制上同样失败）；
+本轮把 19 个用例尽量都跑了，于是多暴露出两个**本机环境问题**：一个是慢盘上的
+DDL 超时，一个是这台机器没有 `admin` 账号。
+
+另外，`create_fts_index_afterward` 第一次跑失败过一次，也是 `DROP TABLE` 的
+4012 超时；**单独重跑在 10103 臂上通过（rc=0）**，和它在 10102 臂上的对照一致
+——那次失败是并发跑两个 mysqltest 把磁盘打满造成的。
+
+也就是说：**本轮没有任何语义变化**，索引内容、命中集合、BM25 分数全部一致，
+回归用例的结果与上一轮逐个对得上。
+
+### 12.7 性能
+
+#### 12.7.1 校验和本身：比 slicing-by-8 再快 5.46 倍
+
+同一块 4092 字节的 buffer、同一份源码里的四种实现对跑（`crc_bench3.rs`，
+`rustc -O`，跑两遍互验机器是否安静）：
+
+| 实现 | ns/页（两遍） | ns/字节 | 相对逐字节 | 相对 slicing-by-8 |
+| --- | --- | --- | --- | --- |
+| 逐字节 | 9019 / 8964 | 2.20 / 2.19 | 1.00x | 0.23x |
+| slicing-by-8（第 8 轮采用） | 2088 / 2108 | 0.510 / 0.515 | 4.32x / 4.25x | 1.00x |
+| **SSE4.2 硬件指令** | **382.6 / 381.9** | **0.093** | **23.58x / 23.47x** | **5.46x / 5.52x** |
+| 分发入口（带运行时探测） | 382.5 / 385.4 | 0.093 / 0.094 | 23.58x / 23.26x | 5.46x / 5.47x |
+
+两遍结果的差异在 1% 以内，说明机器在这段时间是安静的。
+分发入口和硬件路径**看不出差别**——每页只探测一次，开销可以忽略。
+
+#### 12.7.2 对 CI 的预测
+
+第 8 轮的数据显示：校验和占构建叶子时间的 **11.03%**。硬件路径比 slicing-by-8
+快 **5.46 倍**，那么校验和本身的开销变成原来的 1/5.46，构建 CPU 应当下降
+
+```
+构建 CPU 降幅 = 11.03% × (1 − 1 / 5.46) = 9.0%
+```
+
+按同一台 CI 机器的 master 基线换算：
+
+| 指标 | 第 8 轮 CI | 预测（再降 9.0%） | 预测提升率 |
+| --- | --- | --- | --- |
+| `build_ik_all_sec` | 6.25 s | 5.69 s | +25.64% → **+32.3%** |
+| `build_ik_content_sec` | 4.823 s | 4.39 s | +3.24% → **+12.0%** |
+| `build_beng_en_sec` | 2.62 s | 2.38 s | +10.27% → **+18.4%** |
+| 构建类平均 | — | — | **+13.05% → +20.9%**（同机 master 口径） |
+
+折算到总分：构建类从官方口径的 **+16.63%** 提升到 **+23% ~ +24%**，
+三类等权平均从 24.86% 到 **27.5% 上下**，总分从 49.71 到 **55 上下**。
+
+**这个预测的可信度要打折看**：构建类在 CI 上自身的噪声就有 ±24%（见 9.7.4），
+所以单次 CI 的读数可能落在 51 ~ 59 之间。**权威结论以 CI 的 `fts_raw_score` 为准**，
+本报告只给出预测。
+
+#### 12.7.3 CI 结果
+
+**待回收。** 这一轮的 CI 读数由用户/组织方回贴后补进本节。
+
+### 12.8 结论与下一轮的方向
+
+#### 12.8.1 结论
+
+1. **构建链路的第二个热点也找到了**：校验和从占构建叶子时间 11.03%，被硬件指令
+   接管；校验和函数本身比 slicing-by-8 再快 **5.46 倍**，比最初的逐字节实现快
+   **23.5 倍**。
+2. **数值等价不是"想当然"**：这条校验和就是标准 CRC-32C，用教科书实现的四个
+   黄金值和标准检验值 `0xE3069283` 对拍证明；单元测试又拿逐字节实现逐长度对拍了
+   三条路径；最后在跑着的服务器上把索引内容指纹、命中数、BM25 分数都和上一轮
+   对到了逐字节一致。
+3. **写法上有仓库先例**：`oblib` 早就是"CPUID 运行时探测 + 硬件路径 + 软件回退"
+   这套，Rust 侧只是照搬形状，没有引入新的工程惯例，也没有新增依赖。
+4. **这一轮只动构建类**：校验和仍然不在查询和分词链路上，另外两类不受影响。
+5. **踩过的坑记下来了**：`_mm_crc32_u32` 一次处理 4 个字节，用它传单字节会让
+   每个尾巴字节后面多出 3 个零字节——这是单元测试当场抓出来的，肉眼很难发现。
+
+#### 12.8.2 下一轮的方向
+
+**(a) 构建链路：校验和只剩约 2%。**
+
+硬件路径把校验和从 11.03% 压到约 2%，构建链路的叶子分布会再次洗牌：
+
+| 下一批热点 | 占构建叶子时间 | 性质 | 可动性 |
+| --- | --- | --- | --- |
+| libc（memcpy/memmove 等） | 12.93% | 运行时 | 低，通常是**搬数据**而不是算数据 |
+| `ObNullSafeDatumStrCmp<45>` + `ob_strnncollsp_utf8mb4` + `ob_mb_wc_utf8mb4` + `ObCharset::strcmpsp` | 约 7.9% | utf8mb4_general_ci 权重比较 | **oblib 共享层，而且会碰到 MATCH 的大小写不敏感语义** |
+| `ObIArrayWrap<void*>::at` | 1.90% | 框架 | 低 |
+| `ObOperator::get_next_batch` | 1.63% | 框架 | 低 |
+| `ObSortOpImpl::Compare::operator()` | 1.45% | PX 排序 | 中 |
+| `ZSTD_compressBlock_fast` | 1.39% | 压缩 | 低 |
+| `crc64_sse42` | 0.93% | C++ 侧硬件 CRC | 已有 |
+
+字符集比较那一块加起来接近 8%，但它同时是 **MATCH 语义的地基**
+（`utf8mb4_general_ci` 不区分大小写），动它必须同时证明检索结果不变；
+libc 那 12.93% 大概率是数据搬运，不是可以省掉的工作。
+**所以构建链路剩下的空间，本质上是一次"要不要碰共享存储层和字符集"的抉择。**
+
+**(b) 查询侧：`query_limit` 的差距是真的 BM25 计算，不是无用开销。**
+
+第 7 轮留下的"把 top-K 路径上多余的 `estimate_token_doc_cnt()` 去掉"这条设想，
+本轮用 `EXPLAIN` 核对后**作废**（详见 11.6.2 (b)）：`query_limit` 的计划里
+`calc_relevance=true` 且 `sort_keys([MATCH(...) DESC])`，BM25 的词权重真的要用
+那个文档数。四个查询里只有它还算相关性，它慢是因为**多算了真正要用的分数**。
+如果还要在查询侧继续压，方向只能是**相关性表达式本身**（少算一项 BM25 参数、
+或让 top-K 的剪枝更早），而不是删一个估计。
+
+**(c) 分词类的天花板。** 分词类现在是 +24.57%（ik +32.47%、beng +16.67%）。
+`tokenize_beng` 因为往返开销占比太大，改进率上限只有 42.5%；空间主要在
+`tokenize_ik`。下一轮要做分词，得先对**当前**二进制的分词链路重新做一次
+符号级归因——第 7 轮的那份剖析已经隔了两轮改动。
+

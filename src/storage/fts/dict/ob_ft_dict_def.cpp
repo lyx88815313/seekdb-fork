@@ -37,6 +37,14 @@ int32_t ObFTSingleWord::set_word(const char *word, int32_t word_len)
     ret = OB_SIZE_OVERFLOW;
   } else {
     memcpy(this->word, word, word_len);
+    // Zero the rest of the buffer so that the word has exactly one
+    // representation.  The hash of the dictionary map is computed over the
+    // whole fixed size buffer, so a stale byte behind the word would make
+    // the hash of the same word depend on the previous content of the
+    // buffer.
+    if (word_len < ObCharset::MAX_MB_LEN) {
+      memset(this->word + word_len, 0, ObCharset::MAX_MB_LEN - word_len);
+    }
     this->word_len = word_len;
   }
   return ret;

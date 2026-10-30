@@ -60,15 +60,13 @@ private:
   public:
     TokenizeParam();
 
-    int parse_json_param(const ObIJsonBase *obj);
+    int parse_json_param(const ObIJsonBase *obj, common::ObIAllocator &alloc);
 
     // check and reform parser properties to standard format
-    int reform_parser_properties(const ObString &properties);
+    int reform_parser_properties(const ObString &properties, common::ObIAllocator &alloc);
     int try_load_dictionary_for_ik();
 
   public:
-    // for property and tmp json string
-    mutable ObArenaAllocator allocator_;
     ObString parser_name_;
     ObString properties_;
     ObObjMeta meta_;

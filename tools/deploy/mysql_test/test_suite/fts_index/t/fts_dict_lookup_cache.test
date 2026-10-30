@@ -1,0 +1,75 @@
+# owner: seekdb
+# owner group: storage
+# description: verify the dictionary lookups of the tokenizer.  The code of a
+#              character is looked up once per dictionary, the hash of a single
+#              word covers the whole fixed size buffer, and the word frequency
+#              counter keeps the same counts as before.
+
+--disable_warnings
+drop database if exists fts;
+create database fts;
+use fts;
+set ob_query_timeout = 10000000000;
+--enable_warnings
+
+--result_format 4
+
+# 1) many candidate words are alive at the same time, so the same character is
+#    matched against several dictionaries in a row
+select tokenize('中华人民共和国万岁万岁万万岁', 'ik');
+select tokenize('数据库索引全文检索性能优化', 'ik');
+select tokenize('全文索引的分词器热路径优化', 'ik');
+select tokenize('全文索引的分词器热路径优化', 'ik');
+
+# 2) characters that the dictionary does not know must be dropped, also when
+#    they are surrounded by characters that it does know
+select tokenize('龘齾靐灥', 'ik');
+select tokenize('中龘文齾分靐词', 'ik');
+select tokenize('全文索引𠀀的分词器', 'ik');
+
+# 3) the hash of a single character covers the whole fixed size buffer, so the
+#    single characters, the ascii letters, the digits and the punctuation all
+#    have to be found in the dictionary exactly as before
+select tokenize('a', 'ik');
+select tokenize('a', 'beng');
+select tokenize('中', 'ik');
+select tokenize('0', 'ik');
+select tokenize('。。。', 'ik');
+select tokenize('中文abc123', 'ik');
+select tokenize('ABCabc123', 'beng');
+select tokenize('A', 'ik');
+select tokenize('Z', 'beng');
+
+# 4) the ik and the beng parser use different dictionaries and different code
+#    spaces
+select tokenize('database 稳定 index 2024', 'ik');
+select tokenize('database 稳定 index 2024', 'beng');
+
+# 5) the word frequency counter must return the same counts, the detail output
+#    carries the frequency of every token
+select tokenize('全文索引全文检索全文优化', 'ik', '[{"output":"ALL"}]');
+select tokenize('全文索引全文检索全文优化', 'ik', '[{"output":"ALL"}]');
+select tokenize('search search engine search database', 'beng', '[{"output":"ALL"}]');
+select tokenize('全文索引全文检索全文优化', 'ik', '[{"output":"DEFAULT"}]');
+
+# 6) the tokenizer has to keep working after a fulltext index build put the
+#    shared dictionary into use
+create table t (id int primary key, title varchar(512), fulltext index ft_title(title) with parser ik);
+insert into t values (1, '全文索引的分词器热路径优化');
+alter table t add fulltext index ft_title2(title) with parser ik;
+select tokenize('全文索引的分词器热路径优化', 'ik');
+select tokenize('全文索引全文检索全文优化', 'ik', '[{"output":"ALL"}]');
+select id from t where match(title) against('全文索引');
+select id from t where match(title) against('全文索引');
+
+# 7) the doc ids of the merge heap are compared as binary strings, a table
+#    with a binary row key has to return the same rows as a table with a
+#    numeric row key
+create table tb (id varchar(64) primary key, body text, fulltext index ft_body(body) with parser ik);
+insert into tb values ('k1', '全文索引的分词器热路径优化');
+insert into tb values ('k2', '数据库索引与全文检索');
+insert into tb values ('k3', 'nothing to see');
+select id from tb where match(body) against('全文索引') order by id;
+select id from tb where match(body) against('全文索引 全文检索') order by id;
+select count(*) from tb where match(body) against('全文索引');
+select id from tb where match(body) against('全文索引') order by id limit 1;

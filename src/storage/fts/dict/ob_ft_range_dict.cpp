@@ -426,6 +426,27 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+int ObFTRangeDict::find_word_code(const ObString &single_word, ObFTWordCode &code) const
+{
+  int ret = OB_SUCCESS;
+  ObIFTDict *dict = nullptr;
+  if (OB_FAIL(find_first_char_range(single_word, dict))) {
+  } else if (OB_ISNULL(dict)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ret = dict->find_word_code(single_word, code);
+  }
+  return ret;
+}
+
+int ObFTRangeDict::match_with_code(const ObString &single_word,
+                                   const ObFTWordCode code,
+                                   const ObDATrieHit &last_hit,
+                                   ObDATrieHit &hit) const
+{
+  return last_hit.dict_->match_with_code(single_word, code, last_hit, hit);
+}
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;

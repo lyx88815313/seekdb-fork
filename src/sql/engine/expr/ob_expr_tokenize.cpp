@@ -123,6 +123,104 @@ int copy_to_allocator(const ObString &src, common::ObIAllocator &alloc, ObString
   }
   return ret;
 }
+
+// Thread local cache of the normalized parser name.
+//
+// TOKENIZE() normalizes the parser name on every call: the raw name is
+// validated and serialized into the "name.version" form that the rest of the
+// fulltext stack works with.  The result only depends on the raw name, and
+// the built-in parsers use only a handful of distinct names, so the
+// normalized name is cached.  The cache is thread local, so the hot path does
+// not have to take any lock to look it up.
+constexpr int MAX_PARSER_NAME_CACHE_CNT = 4;
+
+struct ObFTParserNameCacheEntry
+{
+  ObFTParserNameCacheEntry() : raw_len_(0), inner_len_(0), is_used_(false) {}
+  // The parser name is rejected by ObFTParserName::set_name() when it does not
+  // fit into OB_FT_PARSER_NAME_LENGTH bytes, so a raw name that can be
+  // normalized always fits into the buffer below.
+  char raw_[storage::OB_FT_PARSER_NAME_LENGTH];
+  int64_t raw_len_;
+  char inner_[storage::OB_FT_PARSER_NAME_LENGTH];
+  int64_t inner_len_;
+  bool is_used_;
+};
+
+struct ObFTParserNameCache
+{
+  ObFTParserNameCache() : next_slot_(0)
+  {
+    for (int i = 0; i < MAX_PARSER_NAME_CACHE_CNT; ++i) {
+      entries_[i] = ObFTParserNameCacheEntry();
+    }
+  }
+  ObFTParserNameCacheEntry entries_[MAX_PARSER_NAME_CACHE_CNT];
+  int next_slot_;
+};
+
+ObFTParserNameCache &get_parser_name_cache()
+{
+  static thread_local ObFTParserNameCache cache;
+  return cache;
+}
+
+// Thread local cache of the token word map.
+//
+// TOKENIZE() collects the tokens of a document in a hash map.  The map keeps
+// its nodes in pooled blocks and allocates the bucket array separately, so
+// building a fresh map for every call allocates and releases both of them on
+// every single call.  The map is therefore kept per thread and reused instead.
+// The iteration order of the map depends on the bucket count, and the bucket
+// count depends on the length of the text, so the cached map is only reused
+// when the requested bucket count is the same; otherwise it is rebuilt, which
+// is never worse than building a new map for every call.
+struct ObFTTokenMapCache
+{
+  ObFTTokenMapCache() : bkt_cnt_(-1) {}
+  storage::ObFTWordMap map_;
+  int64_t bkt_cnt_;
+};
+
+ObFTTokenMapCache &get_token_map_cache()
+{
+  // The cache is deliberately never freed.  Its destructor would release the
+  // bucket array and the node blocks through the global allocator, and a
+  // worker thread may be destroyed after that allocator is already gone.
+  // The memory of one cache per thread is negligible.
+  static thread_local ObFTTokenMapCache *cache = new ObFTTokenMapCache();
+  return *cache;
+}
+
+// Make the cached token map ready for use.
+//
+// need_clear is only set when the document is empty: an empty document does
+// not go through the segmentation, which is the only place that empties the
+// map, so the map has to be emptied here.
+int prepare_token_map(ObFTTokenMapCache &cache, const int64_t bkt_cnt, const bool need_clear)
+{
+  int ret = OB_SUCCESS;
+  if (cache.bkt_cnt_ != bkt_cnt) {
+    if (cache.bkt_cnt_ >= 0) {
+      // The cached map was built for another bucket count.  The bucket count
+      // decides the iteration order of the tokens, so it cannot be reused.
+      cache.map_.destroy();
+      // The map is not usable any more, so the cached bucket count must not
+      // describe it.  Otherwise a failed create below would leave a bucket
+      // count behind that matches the next request, and the next call would
+      // use a map that was never created.
+      cache.bkt_cnt_ = -1;
+    }
+    if (OB_FAIL(cache.map_.create(bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+    } else {
+      cache.bkt_cnt_ = bkt_cnt;
+    }
+  } else if (need_clear) {
+    if (OB_FAIL(cache.map_.reuse())) {
+    }
+  }
+  return ret;
+}
 } // anonymous namespace
 
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
@@ -170,14 +268,14 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
   storage::ObFTParseHelper tokenize_helper;
   const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
   int64_t doc_len = 0;
-  storage::ObFTWordMap token_map;
-
-  ObArenaAllocator tmp_parse_alloc(ObMemAttr("Tmp buffer"));
+  ObFTTokenMapCache &token_map_cache = get_token_map_cache();
+  storage::ObFTWordMap &token_map = token_map_cache.map_;
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
-  } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+  } else if (OB_FAIL(prepare_token_map(
+                   token_map_cache, ft_word_bkt_cnt, 0 == param.fulltext_.length()))) {
   } else if (
       (0 != param.fulltext_.length())
       && OB_FAIL(tokenize_helper.segment(
@@ -210,15 +308,14 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
 }
 
 ObExprTokenize::TokenizeParam ::TokenizeParam()
-  : allocator_(ObMemAttr("TokenizeParam")),
-    parser_name_(ObString(OB_DEFAULT_FULLTEXT_PARSER_NAME)),
+  : parser_name_(ObString(OB_DEFAULT_FULLTEXT_PARSER_NAME)),
     meta_(),
     fulltext_(),
     output_mode_(OUTPUT_MODE::DEFAULT)
 {
 }
 
-int ObExprTokenize::TokenizeParam::parse_json_param(const ObIJsonBase *obj)
+int ObExprTokenize::TokenizeParam::parse_json_param(const ObIJsonBase *obj, common::ObIAllocator &alloc)
 {
   int ret = OB_SUCCESS;
   ObString str;
@@ -262,7 +359,7 @@ int ObExprTokenize::TokenizeParam::parse_json_param(const ObIJsonBase *obj)
       LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser arguments");
     } else {
       ObString json_str;
-      if (OB_FAIL(storage::ObFTParserJsonProps::tokenize_array_to_props_json(allocator_, val, json_str))) {
+      if (OB_FAIL(storage::ObFTParserJsonProps::tokenize_array_to_props_json(alloc, val, json_str))) {
         ObSqlString message;
         message.append_fmt("format in %s form", ADDITIONAL_ARGS_STR);
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, message.ptr());
@@ -298,7 +395,7 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   } else if (OB_FAIL(parse_fulltext(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
+  } else if (OB_FAIL(param.reform_parser_properties(param.properties_, allocator))) {
   } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
   }
   return ret;
@@ -307,16 +404,49 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
 int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParser parser;
+  ObFTParserNameCache &cache = get_parser_name_cache();
+  ObFTParserNameCacheEntry *entry = nullptr;
 
-  char *parser_name_buf = nullptr;
-  if (OB_ISNULL(parser_name_buf
-                = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(parser.init(input_str))) {
-  } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
+  for (int i = 0; i < MAX_PARSER_NAME_CACHE_CNT; ++i) {
+    ObFTParserNameCacheEntry &candidate = cache.entries_[i];
+    if (candidate.is_used_ && candidate.raw_len_ == input_str.length()
+        && (input_str.length() == 0
+            || 0 == memcmp(candidate.raw_, input_str.ptr(), input_str.length()))) {
+      entry = &candidate;
+      break;
+    }
+  }
+
+  if (OB_LIKELY(nullptr != entry)) {
+    param.parser_name_ = ObString(entry->inner_len_, entry->inner_);
   } else {
-    param.parser_name_ = ObString::make_string(parser_name_buf);
+    storage::ObFTParser parser;
+    char parser_name_buf[storage::OB_FT_PARSER_NAME_LENGTH];
+    if (OB_FAIL(parser.init(input_str))) {
+    } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, sizeof(parser_name_buf)))) {
+    } else {
+      const int64_t inner_len = STRLEN(parser_name_buf);
+      const int64_t raw_len = input_str.length();
+      ObFTParserNameCacheEntry &slot = cache.entries_[cache.next_slot_];
+      if (OB_LIKELY(raw_len < static_cast<int64_t>(sizeof(slot.raw_)))) {
+        cache.next_slot_ = (cache.next_slot_ + 1) % MAX_PARSER_NAME_CACHE_CNT;
+        if (raw_len > 0) {
+          MEMCPY(slot.raw_, input_str.ptr(), raw_len);
+        }
+        slot.raw_[raw_len] = '\0';
+        slot.raw_len_ = raw_len;
+      } else {
+        // The raw name does not fit into the cache entry.  ObFTParserName::
+        // set_name() rejects such a name before this point, so the branch is
+        // unreachable; the entry still carries the normalized name, but it is
+        // never matched by a lookup.
+        slot.raw_len_ = -1;
+      }
+      MEMCPY(slot.inner_, parser_name_buf, inner_len + 1);
+      slot.inner_len_ = inner_len;
+      slot.is_used_ = true;
+      param.parser_name_ = ObString(slot.inner_len_, slot.inner_);
+    }
   }
   return ret;
 }
@@ -448,7 +578,7 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
           if (OB_FAIL(base->get_array_element(i, node))) {
           } else if (ObJsonNodeType::J_OBJECT != (node->json_type())) {
             ret = OB_INVALID_ARGUMENT;
-          } else if (OB_FAIL(param.parse_json_param(node))) {
+          } else if (OB_FAIL(param.parse_json_param(node, mm_alloc))) {
           }
         } // for
       }
@@ -458,7 +588,7 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
   return ret;
 }
 
-int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &properties)
+int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &properties, common::ObIAllocator &alloc)
 {
   int ret = OB_SUCCESS;
   storage::ObFTParserJsonProps parser_properties;
@@ -476,7 +606,7 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
     ObFTFormattedPropsEntry *cache = get_formatted_props_cache();
     for (int64_t i = 0; i < MAX_FORMATTED_PROPS_CACHE_CNT; ++i) {
       if (cache[i].is_used_ && is_formatted_props_key_match(cache[i], parser_name_, properties)) {
-        ret = copy_to_allocator(ObString(cache[i].formatted_len_, cache[i].formatted_), allocator_, properties_);
+        ret = copy_to_allocator(ObString(cache[i].formatted_len_, cache[i].formatted_), alloc, properties_);
         cache_hit = OB_SUCC(ret);
         break;
       }
@@ -491,7 +621,7 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
   } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
                                                              ObCollationType::CS_TYPE_UTF8MB4_BIN,
                                                              true))) {
-  } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+  } else if (OB_FAIL(parser_properties.to_format_json(alloc, properties_))) {
   } else {
     // store the result in the cache for the next calls
     common::TCWLockGuard guard(get_formatted_props_cache_lock());

@@ -45,6 +45,10 @@ use file::{read_exact_at, write_all_at, Allocation, FileLock, LIVE};
 use page::{decode_overflow, encode_overflow, encode_root, Child, Entry, Node, Root, Value};
 use page::{INLINE_VALUE_SIZE, MAX_DEPTH, PAYLOAD_SIZE};
 pub use page::{MAX_KEY_SIZE, MAX_VALUE_SIZE, PAGE_SIZE};
+#[cfg(test)]
+pub(crate) use page::{checksum, checksum_bytewise, checksum_slicing};
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) use page::checksum_sse42;
 
 pub type Result<T> = std::result::Result<T, Error>;
 

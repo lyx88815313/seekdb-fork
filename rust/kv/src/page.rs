@@ -290,6 +290,8 @@ pub(crate) fn decode_root(page: &[u8; PAGE_SIZE], physical_pages: u64) -> Option
         .then_some(root)
 }
 
+const CRC_POLYNOMIAL: u32 = 0x82f63b78;
+
 const fn crc_table() -> [u32; 256] {
     let mut table = [0; 256];
     let mut index = 0;
@@ -297,7 +299,7 @@ const fn crc_table() -> [u32; 256] {
         let mut crc = index as u32;
         let mut bit = 0;
         while bit < 8 {
-            crc = (crc >> 1) ^ if crc & 1 != 0 { 0x82f63b78 } else { 0 };
+            crc = (crc >> 1) ^ if crc & 1 != 0 { CRC_POLYNOMIAL } else { 0 };
             bit += 1;
         }
         table[index] = crc;
@@ -308,7 +310,108 @@ const fn crc_table() -> [u32; 256] {
 
 const CRC_TABLE: [u32; 256] = crc_table();
 
-fn checksum(bytes: &[u8]) -> u32 {
+/// Slicing-by-8 tables for the same reflected CRC-32C as [`CRC_TABLE`].
+/// `CRC_TABLES[k][b]` is the contribution of byte `b` when it sits `k + 1`
+/// bytes before the end of the message, so the byte-at-a-time update
+/// `crc = (crc >> 8) ^ CRC_TABLE[(crc ^ byte) & 0xff]` advances one table per
+/// byte. Advancing a byte with a zero input is `(value >> 8) ^ CRC_TABLE[value
+/// & 0xff]`, which builds the next table from the previous one.
+const fn crc_tables() -> [[u32; 256]; 8] {
+    let base = crc_table();
+    let mut tables = [[0u32; 256]; 8];
+    tables[0] = base;
+    let mut level = 1;
+    while level < 8 {
+        let mut index = 0;
+        while index < 256 {
+            let value = tables[level - 1][index];
+            tables[level][index] = (value >> 8) ^ base[(value & 0xff) as usize];
+            index += 1;
+        }
+        level += 1;
+    }
+    tables
+}
+
+const CRC_TABLES: [[u32; 256]; 8] = crc_tables();
+
+/// Checksum eight bytes per iteration instead of one. The result is the same
+/// value the byte-at-a-time loop produced: the state is folded into the first
+/// four bytes of the chunk, and each chunk byte then contributes through the
+/// table that matches its distance from the end of the chunk.
+pub(crate) fn checksum_slicing(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    let mut offset = 0;
+    while offset + 8 <= bytes.len() {
+        let chunk = &bytes[offset..offset + 8];
+        let head = u32::from_le_bytes(chunk[..4].try_into().unwrap());
+        let tail = u32::from_le_bytes(chunk[4..].try_into().unwrap());
+        crc ^= head;
+        crc = CRC_TABLES[7][(crc & 0xff) as usize]
+            ^ CRC_TABLES[6][((crc >> 8) & 0xff) as usize]
+            ^ CRC_TABLES[5][((crc >> 16) & 0xff) as usize]
+            ^ CRC_TABLES[4][((crc >> 24) & 0xff) as usize]
+            ^ CRC_TABLES[3][(tail & 0xff) as usize]
+            ^ CRC_TABLES[2][((tail >> 8) & 0xff) as usize]
+            ^ CRC_TABLES[1][((tail >> 16) & 0xff) as usize]
+            ^ CRC_TABLES[0][((tail >> 24) & 0xff) as usize];
+        offset += 8;
+    }
+    while offset < bytes.len() {
+        crc = (crc >> 8) ^ CRC_TABLE[((crc as u8) ^ bytes[offset]) as usize];
+        offset += 1;
+    }
+    !crc
+}
+
+/// Hardware CRC-32C for x86_64.
+///
+/// The `crc32` instruction computes the same reflected CRC-32C as
+/// [`CRC_TABLE`]: same polynomial, same initial value and same final xor, so
+/// the value it produces is the value the table produces. The instruction
+/// consumes the eight bytes of a chunk in address order, which is the order
+/// the table loop consumes them in.
+///
+/// # Safety
+///
+/// The `sse4.2` target feature must be available on the running CPU.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+pub(crate) unsafe fn checksum_sse42(bytes: &[u8]) -> u32 {
+    use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+
+    // The intrinsics require the same target feature as this function, so
+    // calling them needs no unsafe block of its own.
+    let mut crc = !0u32;
+    let mut offset = 0;
+    while offset + 8 <= bytes.len() {
+        let chunk = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        crc = _mm_crc32_u64(crc as u64, chunk) as u32;
+        offset += 8;
+    }
+    while offset < bytes.len() {
+        crc = _mm_crc32_u8(crc, bytes[offset]);
+        offset += 1;
+    }
+    !crc
+}
+
+/// The page checksum: the hardware instruction on a CPU that has it, the
+/// slicing table everywhere else. Both paths return the same value.
+pub(crate) fn checksum(bytes: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.2") {
+            // SAFETY: the feature was detected on the line above.
+            return unsafe { checksum_sse42(bytes) };
+        }
+    }
+    checksum_slicing(bytes)
+}
+
+/// The byte-at-a-time checksum the slicing implementation must reproduce.
+#[cfg(test)]
+pub(crate) fn checksum_bytewise(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for byte in bytes {
         crc = (crc >> 8) ^ CRC_TABLE[((crc as u8) ^ byte) as usize];

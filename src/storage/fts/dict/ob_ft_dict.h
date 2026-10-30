@@ -18,6 +18,7 @@
 #define _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_H_
 
 #include "lib/string/ob_string.h"
+#include "storage/fts/dict/ob_ft_dict_def.h"
 
 namespace oceanbase
 {
@@ -123,6 +124,25 @@ public:
   virtual int match_with_hit(const ObString &single_word,
                              const ObDATrieHit &last_hit,
                              ObDATrieHit &hit) const = 0;
+
+  // Look up the code of a single word in this dict.
+  //
+  // The code is the offset of the word in the double array trie.  It is
+  // returned separately from the trie walk, because a caller that matches
+  // several words in a row can look the same word up once and reuse the
+  // code for all of them, instead of looking it up again for every word.
+  //
+  // OB_ENTRY_NOT_EXIST is returned when the word is not part of the dict.
+  // The code is only meaningful for the dict that returned it: every dict
+  // has its own code space.
+  virtual int find_word_code(const ObString &single_word, ObFTWordCode &code) const = 0;
+
+  // Match single word with hit, using a code that was obtained from
+  // find_word_code() before.
+  virtual int match_with_code(const ObString &single_word,
+                              const ObFTWordCode code,
+                              const ObDATrieHit &last_hit,
+                              ObDATrieHit &hit) const = 0;
 };
 
 } // namespace storage

@@ -204,14 +204,24 @@ int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
-    } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+    // Insert the word with the count 1 when it is not in the map yet.  This
+    // hashes the word only once for the first occurrence, and it does not
+    // replace the node of a word that is already in the map.
+    ret = word_map_.set_refactored(word, 1/*word count*/, 0/*do not overwrite*/);
+    if (OB_HASH_EXIST == ret) {
+      // The word is in the map already, so its count has to be accumulated.
+      ret = OB_SUCCESS;
+      if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
+      } else {
+        if (OB_HASH_NOT_EXIST == ret) {
+          word_count = 1;
+        } else {
+          word_count += word_freq;
+        }
+        if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+        }
+      }
     }
   }
   return ret;

@@ -15,6 +15,8 @@
  */
 
 #define USING_LOG_PREFIX SQL_DAS
+#include <cstring>
+
 #include "ob_das_match_iter.h"
 #include "sql/das/ob_das_ir_define.h"
 
@@ -670,7 +672,8 @@ ObDASMatchMergeCmp::ObDASMatchMergeCmp()
   : cmp_func_(nullptr),
     iter_ids_(nullptr),
     datum_access_ctx_(nullptr),
-    is_inited_(false)
+    is_inited_(false),
+    fast_bin_string_(false)
 {
 }
 
@@ -697,6 +700,9 @@ int ObDASMatchMergeCmp::init(
     if (OB_ISNULL(cmp_func_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
+      // The doc id column is a binary string, so the comparison is a plain
+      // memcmp plus the length difference.
+      fast_bin_string_ = is_string_type;
       is_inited_ = true;
     }
   }
@@ -713,9 +719,16 @@ int ObDASMatchMergeCmp::cmp(
     ret = OB_NOT_INIT;
   } else {
     int tmp_ret = 0;
-    if (OB_FAIL(cmp_func_(
-            get_id_datum(l.iter_idx_), get_id_datum(r.iter_idx_), tmp_ret,
-            datum_access_ctx_))) {
+    const ObDatum &l_id = get_id_datum(l.iter_idx_);
+    const ObDatum &r_id = get_id_datum(r.iter_idx_);
+    if (OB_LIKELY(fast_bin_string_) && OB_LIKELY(!l_id.is_null() && !r_id.is_null())) {
+      // This is the same order as ob_strnncollsp_binary(): the bytes are
+      // compared first and the length difference breaks the tie when one
+      // string is a prefix of the other.
+      const int64_t min_len = MIN(l_id.len_, r_id.len_);
+      const int mem_cmp = (min_len > 0) ? memcmp(l_id.ptr_, r_id.ptr_, static_cast<size_t>(min_len)) : 0;
+      cmp_ret = (0 == mem_cmp) ? (static_cast<int64_t>(l_id.len_) - static_cast<int64_t>(r_id.len_)) : mem_cmp;
+    } else if (OB_FAIL(cmp_func_(l_id, r_id, tmp_ret, datum_access_ctx_))) {
     } else {
       cmp_ret = tmp_ret;
     }

@@ -74,7 +74,7 @@ public:
   {
     int ret = OB_ENTRY_NOT_EXIST;
     const uint32_t capacity = header_.capacity_;
-    uint32_t index = hash_index(hash_word(word.word, word.word_len), capacity);
+    uint32_t index = hash_index(hash_single_word(word), capacity);
     while (header_.data[index].used) {
       if (header_.data[index].word == word) {
         code = header_.data[index].code;
@@ -88,6 +88,25 @@ public:
       }
     }
     return ret;
+  }
+
+  // Hash of a single word.
+  //
+  // A word is a single character of at most ObCharset::MAX_MB_LEN bytes, so
+  // it is kept in a fixed size buffer whose content behind the word is
+  // always zero (see ObFTSingleWord::set_word).  Hashing that buffer together
+  // with the length gives the same distribution as hashing the word bytes,
+  // but it does not need a copy of a runtime length, which would be a call
+  // into the libc memcpy for every character that is looked up.
+  static OB_INLINE uint64_t hash_single_word(const ObFTSingleWord &word)
+  {
+    uint64_t chunk = 0;
+    MEMCPY(&chunk, word.word, sizeof(word.word));
+    uint64_t hash = chunk ^ (static_cast<uint64_t>(word.word_len) * 0x9E3779B97F4A7C15ULL);
+    hash ^= hash >> 29;
+    hash *= 0xBF58476D1CE4E5B9ULL;
+    hash ^= hash >> 32;
+    return hash;
   }
 
   // A word is at most ObCharset::MAX_MB_LEN bytes, so it fits into a register.
@@ -221,6 +240,21 @@ public:
   int match_with_hit(const ObString &single_word,
                      const ObDATrieHit &last_hit,
                      ObDATrieHit &hit) const;
+
+  // Look up the code of a single word.
+  //
+  // The code is the offset of the word in the double array trie.  It is
+  // looked up separately from the trie walk, because a caller that matches
+  // several words in a row can look the same word up once and reuse the
+  // code, instead of looking it up again for every word.
+  int find_code(const ObString &single_word, ObFTWordCode &code) const;
+
+  // Match single word with hit, using a code that was obtained from
+  // find_code() before.
+  int match_with_code(const ObString &single_word,
+                      const ObFTWordCode code,
+                      const ObDATrieHit &last_hit,
+                      ObDATrieHit &hit) const;
 
 private:
   ObFTDAT *dat_;

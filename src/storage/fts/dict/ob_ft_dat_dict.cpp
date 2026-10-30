@@ -247,6 +247,55 @@ int ObFTDATBuilder<DATA_TYPE>::encode(const ObString &word, ObFTWordCode &code, 
 }
 
 template <typename DATA_TYPE>
+int ObFTDATReader<DATA_TYPE>::find_code(const ObString &single_word, ObFTWordCode &code) const
+{
+  int ret = OB_SUCCESS;
+  ObFTSingleWord word;
+  word.set_word(single_word.ptr(), single_word.length());
+  ret = dat_->get_map()->find(word, code);
+  return ret;
+}
+
+template <typename DATA_TYPE>
+int ObFTDATReader<DATA_TYPE>::match_with_code(const ObString &ft_char,
+                                               const ObFTWordCode code,
+                                               const ObDATrieHit &last_hit,
+                                               ObDATrieHit &hit) const
+{
+  int ret = OB_SUCCESS;
+  hit.set_unmatch();
+  int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
+  int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
+
+  if (&last_hit == &hit) {
+    // sameone
+  } else {
+    hit = last_hit;
+  }
+  if (0 == hit.base_idx_) {
+    hit.base_idx_ = 1; // from current to do check;
+  }
+  // from current place to do check
+  int32_t idx = abs(base[hit.base_idx_]) + code;
+
+  if (check[idx] != hit.base_idx_) {
+    hit.set_unmatch();
+  } else if (base[idx] < 0) {
+    hit.base_idx_ = idx;
+    hit.end_pos_ = hit.end_pos_ + ft_char.length();
+    hit.char_cnt_++;
+    hit.set_match();
+    hit.set_prefix(); // to be checked next time
+  } else {
+    hit.base_idx_ = idx;
+    hit.end_pos_ = hit.end_pos_ + ft_char.length();
+    hit.char_cnt_++;
+    hit.set_prefix();
+  }
+  return ret;
+}
+
+template <typename DATA_TYPE>
 int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
                                              const ObDATrieHit &last_hit,
                                              ObDATrieHit &hit) const
@@ -254,42 +303,12 @@ int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
   int ret = OB_SUCCESS;
   ObFTWordCode code;
   hit.set_unmatch();
-  auto *map = dat_->get_map();
-  int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
-  int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
-
-  ObFTSingleWord word;
-  word.set_word(ft_char.ptr(), ft_char.length());
-  if (OB_FAIL(dat_->get_map()->find(word, code)) && OB_ENTRY_NOT_EXIST != ret) {
-  } else if (OB_ENTRY_NOT_EXIST == ret) {
-    ret = OB_SUCCESS;
-    hit.set_unmatch();
-  } else {
-    if (&last_hit == &hit) {
-      // sameone
-    } else {
-      hit = last_hit;
-    }
-    if (0 == hit.base_idx_) {
-      hit.base_idx_ = 1; // from current to do check;
-    }
-    // from current place to do check
-    int32_t idx = abs(base[hit.base_idx_]) + code;
-
-    if (check[idx] != hit.base_idx_) {
+  if (OB_FAIL(find_code(ft_char, code))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
       hit.set_unmatch();
-    } else if (base[idx] < 0) {
-      hit.base_idx_ = idx;
-      hit.end_pos_ = hit.end_pos_ + ft_char.length();
-      hit.char_cnt_++;
-      hit.set_match();
-      hit.set_prefix(); // to be checked next time
-    } else {
-      hit.base_idx_ = idx;
-      hit.end_pos_ = hit.end_pos_ + ft_char.length();
-      hit.char_cnt_++;
-      hit.set_prefix();
     }
+  } else if (OB_FAIL(match_with_code(ft_char, code, last_hit, hit))) {
   }
   return ret;
 }
@@ -303,7 +322,15 @@ int ObArrayHashMap::insert(const ObString &key, ObFTWordCode code)
 {
   int ret = OB_SUCCESS;
   const uint32_t capacity = header_.capacity_;
-  uint32_t index = hash_index(hash_word(key.ptr(), key.length()), capacity);
+  // The lookup hashes the fixed size word buffer, so the insert has to use
+  // the very same hash for the words that a lookup is able to find.
+  ObFTSingleWord word;
+  const bool word_fits = (key.length() <= static_cast<int64_t>(sizeof(word.word)));
+  if (word_fits) {
+    word.set_word(key.ptr(), key.length());
+  }
+  const uint64_t hash = word_fits ? hash_single_word(word) : hash_word(key.ptr(), key.length());
+  uint32_t index = hash_index(hash, capacity);
   while (header_.data[index].used) {
     index += 3;
     if (OB_UNLIKELY(index >= capacity)) {
@@ -312,7 +339,11 @@ int ObArrayHashMap::insert(const ObString &key, ObFTWordCode code)
   }
 
   header_.data[index].code = code;
-  header_.data[index].word.set_word(key.ptr(), key.length());
+  if (word_fits) {
+    header_.data[index].word = word;
+  } else {
+    header_.data[index].word.set_word(key.ptr(), key.length());
+  }
   header_.data[index].used = true;
   header_.count_++;
   return ret;

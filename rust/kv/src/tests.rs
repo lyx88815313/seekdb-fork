@@ -586,3 +586,74 @@ fn interrupted_commit_recovers_all_or_none_in_a_new_process() {
         }
     }
 }
+
+fn pseudo_random_bytes(length: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut bytes = Vec::with_capacity(length);
+    for _ in 0..length {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        bytes.push((state >> 33) as u8);
+    }
+    bytes
+}
+
+#[test]
+fn checksum_matches_the_byte_at_a_time_value() {
+    // The page checksum is part of the on-disk format, so the slicing
+    // implementation has to reproduce the byte-at-a-time value exactly. The
+    // expected values below come from the byte-at-a-time loop.
+    assert_eq!(checksum(b""), 0x0000_0000);
+    assert_eq!(checksum(b"abc"), 0x364b_3fb7);
+    let ramp: Vec<u8> = (0..256).map(|value| value as u8).collect();
+    assert_eq!(checksum(&ramp), 0x9c44_184b);
+    let page: Vec<u8> = (0..4092).map(|index| ((index * 31 + 7) & 0xff) as u8).collect();
+    assert_eq!(checksum(&page), 0xfd13_8994);
+
+    for length in 0..300usize {
+        let data = pseudo_random_bytes(length, 0x9e37_79b9_7f4a_7c15 ^ length as u64);
+        assert_eq!(checksum(&data), checksum_bytewise(&data), "length {length}");
+    }
+    for seed in 0..8u64 {
+        let data = pseudo_random_bytes(4092, seed + 1_000_000_007);
+        assert_eq!(checksum(&data), checksum_bytewise(&data), "seed {seed}");
+    }
+}
+
+#[test]
+fn slicing_checksum_matches_the_byte_at_a_time_value() {
+    // The fallback path runs on every CPU without the hardware instruction, so
+    // it has to reproduce the byte-at-a-time value on its own.
+    for length in 0..300usize {
+        let data = pseudo_random_bytes(length, 0x1234_5678_9abc_def0 ^ length as u64);
+        assert_eq!(checksum_slicing(&data), checksum_bytewise(&data), "length {length}");
+    }
+    for seed in 0..8u64 {
+        let data = pseudo_random_bytes(4092, seed + 2_000_000_003);
+        assert_eq!(checksum_slicing(&data), checksum_bytewise(&data), "seed {seed}");
+    }
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn hardware_checksum_matches_the_byte_at_a_time_value() {
+    // The hardware instruction is used for the page checksum whenever the CPU
+    // has it, and the value is part of the on-disk format, so the instruction
+    // is compared with the reference loop on every run that has the feature.
+    if !std::arch::is_x86_feature_detected!("sse4.2") {
+        return;
+    }
+    // SAFETY: the feature was detected on the line above.
+    let hardware = |data: &[u8]| unsafe { checksum_sse42(data) };
+    assert_eq!(hardware(b""), checksum_bytewise(b""));
+    assert_eq!(hardware(b"abc"), checksum_bytewise(b"abc"));
+    for length in 0..300usize {
+        let data = pseudo_random_bytes(length, 0x5eed_5eed_0bad_f00d ^ length as u64);
+        assert_eq!(hardware(&data), checksum_bytewise(&data), "length {length}");
+    }
+    for seed in 0..8u64 {
+        let data = pseudo_random_bytes(4092, seed + 3_000_000_017);
+        assert_eq!(hardware(&data), checksum_bytewise(&data), "seed {seed}");
+    }
+}
