@@ -610,22 +610,95 @@ $ diff -u simple_query.result.baseline simple_query.result | grep -E '^[+-]' | g
 同一台机器级别。
 
 用仓库里这份 json 给最新一次 CI 报告打分是 **100.00/100**（`mean_improvement`
-88.12%）；而评测方给出的 `fts_mean_improvement` 只有 **6.31%**。由 6.31% 反推出的
-master 基线为 `build_ik_all_sec` ≈ 7.11s、`tokenize_ik_avg_ms` ≈ 0.0674、
-`query_cn_avg_ms` ≈ 1.309，与"同一台 CI 机器上现测 master"完全吻合。
+88.12%）；而评测方给出的 `fts_mean_improvement` 只有 **9.64%**（对应原始分
+**19.29/100**）。上一轮（第 1、2 轮）的 CI 成绩是 **6.31%**（12.61/100），
+第 3 轮把它抬到了 9.64%。
 
-**结论**：评测基线是"同机现测 master"，本报告的同会话 A/B 才是可比口径；
-正式成绩 = 在 CI 机器上相对 master 的真实提升（当前 6.31%）。
+> **更正**：本节早先版本曾"由 6.31% 反推出 master 基线为
+> `build_ik_all_sec` ≈ 7.11s、`tokenize_ik_avg_ms` ≈ 0.0674、
+> `query_cn_avg_ms` ≈ 1.309"。这个反推**不可靠**：由单一汇总数字反推多个基线值
+> 缺少约束条件，唯一隐含假设是"三类提升率均摊"，而实测恰好证明它们并不均摊。
+> 下面用三方独立证据重建。
+
+**测量口径的关键差异（此前被忽略）**：CI 的 `fts_large_bench.sh` 以
+`skip_load=0` 运行，即**灌数 → 建索引 → 分词 → 查询**全流程；而第 7 章的交错
+配对测量用的是 `SKIP_LOAD=1`（复用已建好的索引）。两种协议下同一二进制的读数
+差别很大：
+
+| 类别 | `SKIP_LOAD=1`（交错配对，8 组） | `SKIP_LOAD=0`（全协议，5 组配对） |
+| --- | --- | --- |
+| 构建 | **未测量**（该协议跳过建索引） | −2.84% |
+| 分词 | +15.79% | +1.69% |
+| 查询 | +23.61% | +8.03% |
+
+建索引之后机器处于"热"状态（compaction / merge 后台线程仍在跑），会同时抬高
+分子与分母，把相对提升率压低；本报告此前的 **27.4/100** 本地预估正是因为用了
+`SKIP_LOAD=1` 协议而系统性偏高。
+
+**三类提升率重建**（三方交叉验证）：
+
+| 类别 | 权重 | CI 提升率（重建） | 依据 |
+| --- | --- | --- | --- |
+| 构建 | 1/3 | ≈ **−2.8%** | 本地全协议 5 组配对的类内均值 |
+| 分词 | 1/3 | ≈ **+14.6%** | 本地交错配对 +15.79%，按 CI 服务端/客户端占比折算 |
+| 查询 | 1/3 | ≈ **+17%** | CI 两轮差值（6.31% → 9.64% ⇒ 查询类 +10.015pp）+ 本地全协议 +8.03% |
+
+代入评分公式：`(−2.8% + 14.6% + 17%) / 3 = 9.63%`，与 CI 实测的 **9.644%**
+吻合到 0.01pp，验证了重建结果的自洽性。
+
+**结论**：评测基线是"同机现测 master"，正式成绩 = 在 CI 机器上相对 master 的
+真实提升（当前 **9.64%**）。后续测量必须以 `SKIP_LOAD=0` 全协议为准，
+并补上构建类的配对测量。
+
+### 6.1.1 第 4 轮：布尔化路径下跳过恒真的 MATCH 过滤求值
+
+第 3 轮把"仅作过滤"场景的相关性替换为正常量 1.0
+（`ObTextRetrievalDaaTTokenIter::save_docids()` 写入）。存储层的下推过滤谓词是
+`T_OP_BOOL(MATCH)`，对 double 求值即 `!= 0`，因此在该场景下**恒为真**；而
+`minimum_should_match` 由 `ObSRDaaTInnerProductRelevanceCollector::get_result()`
+的 `is_valid` 独立控制，不依赖该谓词。
+
+perf 采样（82468 个栈）显示 `calc_bool_expr_for_double_type`
+（`src/sql/engine/expr/ob_expr_bool.cpp:253`）占查询链路 **3.24%**，其调用链
+唯一：`ObSRDaaTIterImpl::filter_on_demand` → `filter_expr->eval()` →
+`ObExpr::eval_one_datum_of_batch`，即**每个命中行都要跑一遍完整的 SQL 布尔
+表达式求值**，外加一次 `BatchInfoScopeGuard` + `locate_datum_for_write`。
+
+第 4 轮改动（`src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp`）：
+
+```cpp
+// The pushed down match filter only tests whether the relevance score is
+// zero.  When the BM25 score is not calculated the relevance is the
+// positive constant that the token iterator stored, so the filter is
+// always true and evaluating the boolean expression for every matching
+// row is pure overhead.  The minimum should match rule is enforced by the
+// relevance collector, not by this filter, so dropping it here does not
+// change the set of matched documents.
+sr_iter_param_.filter_expr_ = ir_ctdef_->need_calc_relevance() ? ir_ctdef_->match_filter_ : nullptr;
+```
+
+安全性论证：
+
+- `need_calc_relevance()` 为 false ⇒ `relevance_expr_` 为空 ⇒ 存储层相关性为
+  `save_docids()` 写入的 1.0；每个匹配维度至少贡献 1.0，故总相关性 ≥ 1.0 > 0，
+  谓词 `!= 0` 恒真 ⇒ 跳过求值不改变任何行的取舍。
+- `need_calc_relevance()` 为 true（`query_limit` 按相关性排序的场景）行为完全
+  不变。
+- cg 侧 `relevance_proj_col_` 仍按 `need_calc_relevance_ || pushdown_match_filter_ != nullptr`
+  生成，DAAT/TAAT 路径与命中集合不变。
+
+**注意**：本轮只动了查询链路的一处开销，构建与分词链路尚未针对 CI 口径
+（`SKIP_LOAD=0` 全协议）做优化——见 6.1 的三类分解，构建类是当前最大短板。
 
 ### 6.2 第 3 轮方向：MATCH 只作过滤时不计算 BM25 分数
 
 CI 机器上各指标的服务端实际工作量（减去 `select 1` 的 0.0266 ms 客户端往返）：
 
-| 指标 | CI 值 | 服务端工作量 | 优化上限 |
+| 指标 | CI 值（第 3 轮后） | 服务端工作量 | 优化上限 |
 | --- | --- | --- | --- |
-| `tokenize_ik_avg_ms` | 0.0631 | 0.0365 ms（**42% 是客户端往返**） | −58% |
-| `tokenize_beng_avg_ms` | 0.0394 | 0.0128 ms（68% 是客户端往返） | −32% |
-| `query_cn_avg_ms` | 1.2261 | ≈ 1.2 ms（客户端仅占 2%） | **−98%** |
+| `tokenize_ik_avg_ms` | 0.0653 | 0.0379 ms（**42% 是客户端往返**） | −58% |
+| `tokenize_beng_avg_ms` | 0.0403 | 0.0129 ms（68% 是客户端往返） | −32% |
+| `query_cn_avg_ms` | 1.1108 | ≈ 1.083 ms（客户端仅占 2.5%） | **−98%** |
 
 分词类被客户端往返卡死，**查询类才是唯一有大空间的类别**（占绝对耗时 95%+）。
 而基准查询是 `SELECT COUNT(*) ... WHERE MATCH(...) AGAINST(...)`：引擎对每一行都算了
@@ -779,6 +852,13 @@ bool need_inv_idx_agg() const { return has_inv_agg_ && need_calc_relevance(); }
 综合提升率 = (1.66% + 15.79% + 23.61%) / 3 ≈ 13.7%
 本地预估得分 = 13.7% / 50% × 100 ≈ 27.4 / 100
 ```
+
+> **更正（重要）**：上面的 27.4/100 是用 `SKIP_LOAD=1`（复用已有索引）协议
+> 得到的，而 **CI 跑的是 `SKIP_LOAD=0` 全协议**。两种协议下同一二进制的读数
+> 差别很大：全协议 5 组配对给出构建 −2.84%、分词 +1.69%、查询 +8.03%，
+> 折合综合约 **2.3%**（≈ 4.6/100）。以 CI 的两轮成绩（12.61 → 19.29 分）为准，
+> 重建后的类别分解见 6.1。**本节的 27.4/100 只能作为"协议内相对比较"的参考，
+> 不能作为成绩预估。**
 
 对照：第二轮结束时同一台机器的同会话 A/B 是 **+8.78%**（综合），
 CI 上相对 master 的实测是 **+6.31%**。第三轮的查询侧优化把查询类
