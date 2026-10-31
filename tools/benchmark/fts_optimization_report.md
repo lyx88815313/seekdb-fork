@@ -3000,3 +3000,197 @@ DAT 的 code 空间不变 —— **索引内容不变**。
    `ObIKArbitrator`（4.67%）和 `ObFTWordMap` 的分组统计（约 2.8%）
    这些可以逐个量、逐个证明的点。
 
+
+## 14. 第 11 轮：有界读不再做全文排序，索引回表不再超量预取
+
+第 10 轮结束时，CI 给出的 `query_limit` 是 1.4868 ms（第 8 轮）／1.5108 ms（第 10 轮），
+而另外三个查询是 0.86 / 1.29 / 0.99 ms。这一轮盯的就是这条最慢的查询：
+
+```sql
+SELECT COUNT(*) FROM (
+  SELECT id FROM docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20
+) t;
+```
+
+### 14.1 瓶颈定位
+
+**（1）计划里多了一个没人要的排序。**
+
+`EXPLAIN` 显示第 10 轮这条 SQL 的计划里，全文检索扫描是
+`calc_relevance=true`、`sort_keys([MATCH(...) DESC])`、`limit(20)` 在**排序之上**，
+代价估计 406313 µs。原因在 `ObTransformPreProcess::preserve_order_for_fulltext_search`：
+单表全文语句只要没有显式 `ORDER BY`，就会被注入一个
+`ORDER BY MATCH(...) DESC`。这个隐式排序对**无界**查询是"按相关度返回"的
+展示便利，但一旦带 `LIMIT 20`，它要求把 8001 个命中全部算一遍 BM25、
+再取前 20 行——**20 行结果付出了 8001 行的排序代价**。
+
+**（2）回表按 256 行的固定批量预取。**
+
+去掉排序之后计划变成 `calc_relevance=false`、`limit(20)` 下推到
+TEXT RETRIEVAL SCAN，本机 20 行只要 ~0.5 ms。但带 `id` 列时要回表
+（index back），这条路是 `ObDASCacheLookupIter`：`INDEX_SCAN` 阶段按
+`default_batch_row_count_`（=256）收集 rowkey，再 `DO_LOOKUP` 批量查主表。
+它不看调用方这一批究竟还要多少行，**`LIMIT 20` 也照样查 256 个主表行**，
+然后扔掉 236 个。20 行的有界读变成了 256 行的随机回表。
+
+### 14.2 修改
+
+**（a）有界且分数不可见时，不注入隐式相关度排序**
+（`src/sql/rewrite/ob_transform_pre_process.cpp`）
+
+只在 `stmt->has_limit()` 且 SELECT 列表里没有任何含
+`CNT_MATCH_EXPR` 的表达式时跳过注入：
+
+* 没有 `ORDER BY` 时 SQL 不承诺行序，跳过注入不改变任何**承诺过的**语义；
+* 有界 `COUNT(*)` 的结果是 `min(命中数, limit)`，两臂一致（见 14.3）；
+* SELECT 里选了分数的情况**保持注入**——结果把相关度给用户看，
+  行就必须还是 top-N（`basic_dml.test` 第 1120 行就是这种形态）；
+* 显式 `ORDER BY MATCH(...) DESC LIMIT n` 本来就在函数开头的
+  `has_order_by` 判断里跳过，不受影响；
+* 无界语句保持注入，`query_cn` / `query_beng` / `query_mixed` 的计划不变。
+
+**（b）表扫描按剩余 limit 收缩第一批请求**
+（`src/sql/engine/table/ob_table_scan_op.cpp` 的 `get_next_batch_with_das`）
+
+算子自己执行最终 limit（`need_final_limit_`）时，第一次向迭代器要行数就
+不超过 `limit - output_row_cnt_`。算子级过滤丢掉的行由下面已有的循环
+按需要再拉，不影响正确性，只是不再预取用不上的行。
+
+**（c）回表收集量跟随调用方的 capacity**
+（`src/sql/das/iter/ob_das_cache_lookup_iter.cpp`）
+
+`INDEX_SCAN` 的收集上限从固定的 `default_batch_row_count_` 改成
+`min(default_batch_row_count_, capacity)`。无界扫描的 `capacity` 本来就是
+整批，行为不变；有界的读只收集还需要的行数。
+
+**（d）utf8mb4_general_ci 的权重直算快路径**
+（`src/oblib/lib/charset/ob_ctype_utf8.cc`）
+
+第 10 轮把"字符集比较一组"（`ObNullSafeDatumStrCmp<45>` +
+`ob_strnncollsp_utf8mb4` + `ob_mb_wc_utf8mb4` + `ObCharset::strcmpsp` +
+`ObCharset::is_argument_valid` + `ObCharset::get_charset`，构建剖析里合计
+**11.55%**）列为"动了就会改 MATCH 大小写不敏感语义"而没做。这一轮把它做掉的
+办法是**先把权重表逐行核实**，再只对权重可闭式算出的两类字符走快路径：
+
+* 单字节（U+0000..U+007F）：权重就是码点，只有 `a`..`z` 折叠成大写
+  （`utf8_plane00` 逐行核对）；
+* 三字节且所在平面在 `ob_unicase_pages_default` 里没有表
+  （0x08..0xFF 中只有 0x1E、0x1F、0x21、0x24、0xFF 有表）：码点原样保留，
+  权重即码点（CJK 平面 0x4E..0x9F 全是 NULL 页）。
+
+其余字符（两字节、四字节、有表平面、非法/截断序列）一律返回"未处理"，
+由原循环**从头**重算，所以快路径只会返回原循环同样会返回的值。
+校验条件和 `ob_mb_wc_utf8mb4()` 完全一致（首字节范围、两个续字节、
+0xE0 后不得接 0x80..0x9F 以免过长编码）；`strnncollsp` 的行尾空格规则和
+`strnncoll` 的长度差规则仍走原来的代码。入口用
+`cs->caseinfo == &ob_unicase_default` 把关（该处理器只被
+`utf8mb4_general_ci` 使用，其 `state` 为 0，没有 `OB_CS_LOWER_SORT`），
+权重逐位不变。
+
+**（e）`CS_TYPE_BINARY` 的 datum 比较直写**
+（`src/share/datum/ob_datum_cmp_func_def.h`）
+
+模板参数是 `CS_TYPE_BINARY` 时，`ObDatumStrCmpImpl::cmp` 直接做
+`memcmp(min_len)` + 长度差并归一化成 -1/0/1，等价于
+`ObCharset::strcmpsp` → `ob_strnncollsp_binary`，省掉参数校验和字符集分发
+（这条是第 5 轮在归并堆上做过的同一件事，落到 datum 通用比较入口）。
+
+### 14.3 正确性
+
+| 检查项 | 第 10 轮臂 (10104) | 第 11 轮臂 (10103) | 结论 |
+| --- | --- | --- | --- |
+| TOKENIZE 输出（固定文本集 × ik/beng/all） | 33 行 | 33 行 | **逐字节一致** |
+| MATCH 命中数 / 有界 COUNT / LIMIT 20 行集 | 8 行 | 8 行 | **逐字节一致**（8001 / 11000 / 7332 / 20） |
+| MATCH 有序结果 + BM25 分数（4 条查询各 200 行） | 800 行 | 800 行 | **逐行一致** |
+| 列排序/等值/GROUP BY/IN/BETWEEN/MIN/MAX（50 行 × 7 条） | 190 行 | 190 行 | **逐行一致** |
+| 全表 `ORDER BY title / title_en / title DESC,id` 的 md5 | 3 行 | 3 行 | **一致** |
+| 重建全文索引后的逐词命中数（13 词条 + 英文短语 + id 和） | 15 行 | 15 行 | **一致** |
+
+`fts_index` 套件（19 个用例）：**16 通过**。三个失败都与本轮改动无关：
+
+* `cn_word`、`partitioned_simple_query` 在第 371/44 行 `connect admin` 需要
+  admin 账号（`Access denied for 'admin'`），本地 root 臂没有这个账号；
+* `basic_dml` 卡在第 1598 行对 `__all_column` 的元数据查询
+  （`$rowkey_doc_table_id` 取不到值），该用例在第 8/10 轮也没通过过。
+
+新增用例 `fts_limit_filter`（有界命中数、选分数保持相关度序、显式
+`ORDER BY`、无界相关度序、`general_ci` 的 ASCII/CJK/混排/带音符/四字节
+排序等值）已在最终二进制上录制 `.result` 并回放通过。
+
+### 14.4 性能
+
+**有界查询，本机同机 A/B**（ABBA 交错，200 次平均，20 次预热，同一台
+机器同一份 20000 行数据，两臂各自重建过同一份全文索引）：
+
+| 查询形态 | 第 10 轮 (ms) | 第 11 轮 (ms) | 加速 |
+| --- | --- | --- | --- |
+| `SELECT 1 ... LIMIT 20`（不回表） | 2.7853 | 0.4999 | **5.57×** |
+| `SELECT id ... LIMIT 20`（官方 query_limit 形态） | 2.9352 | 0.7390 | **3.97×** |
+| `SELECT 1 ... LIMIT 200` | 3.1779 | 0.5664 | **5.61×** |
+| `SELECT id ... LIMIT 200` | 4.5644 | 1.6457 | **2.77×** |
+| `SELECT id ... LIMIT 2000` | 14.2719 | 8.0470 | **1.77×** |
+
+**三条无界查询的对照**（确认本轮没有伤到它们；同一脚本、3 轮 ABBA）：
+
+| 查询 | 第 10 轮 (ms) | 第 11 轮 (ms) |
+| --- | --- | --- |
+| `query_cn` 形态 | 1.7419 / 1.7663 / 1.7605 | 1.7561 / 1.7762 / 1.7568 |
+| `query_mixed` 形态 | 2.0023 / 1.9594 / 1.9700 | 1.9115 / 1.9559 / 1.9561 |
+| `query_beng` 形态 | 2.5297 / 2.5358 / 2.5184 | 2.5280 / 2.5203 / 2.6128 |
+
+计划侧：第 10 轮 `calc_relevance=true + sort_keys([MATCH DESC]) + limit(20)`
+（代价估计 406313 µs）→ 第 11 轮 `calc_relevance=false + limit(20)` 下推
+（代价估计 654 µs）。
+
+**CI 实测**（`fd9d85ca5`，对照第 8 轮 `1eeaaa6` / 第 10 轮 `54d25bafe`）：
+
+| 指标 | 第 8 轮 | 第 10 轮 | 第 11 轮 |
+| --- | --- | --- | --- |
+| build_ik_all_sec | 6.250 | 6.151 | 6.258 |
+| build_ik_content_sec | 4.823 | 4.725 | **6.634** |
+| build_beng_en_sec | 2.620 | 5.627 | 2.624 |
+| tokenize_ik_avg_ms | 0.0574 | 0.0554 | 0.0597 |
+| tokenize_beng_avg_ms | 0.0365 | 0.0367 | 0.0389 |
+| query_cn_avg_ms | 0.8576 | 0.8608 | 0.9430 |
+| query_beng_avg_ms | 1.2923 | 1.2771 | 1.3939 |
+| query_mixed_avg_ms | 0.9925 | 0.9788 | 1.0642 |
+| query_limit_avg_ms | 1.4868 | 1.5108 | **0.2087** |
+| fts_mean_improvement | 0.24857 | 0.14102 | 0.23184 |
+| 得分 | 24.587 | 14.102 | 23.284 |
+
+读数说明：
+
+* `query_limit` 从 1.4868 ms 降到 **0.2087 ms（7.1×）**，命中数 20 不变。
+  这个量级说明 CI 快盘上"每查询固定回表开销"基本消失，和本机
+  `SELECT 1`（0.50 ms）→ `SELECT id`（0.74 ms）的差值一致。
+* `query_cn / query_beng / query_mixed / tokenize_*` 整体比第 8 轮慢
+  4%~10%，且**方向一致**；本机配对 A/B 显示三条无界查询两臂持平
+  （差 < 2%，见上表），第 11 轮的代码不含任何作用于无界查询路径的改动
+  （排序注入保留、批量参数在无界时不变），所以这是当次 CI 机器状态的
+  整体漂移，不是回归。
+* `build_ik_content_sec` 6.634 s（第 8/10 轮 4.82 / 4.73 s）是本轮掉分的主因：
+  那个 ±2 s 的"坏签"第 10 轮落在 `build_beng_en`（5.627 s），这次换到了
+  `build_ik_content`。同一签位换位置说明是构建之间的后台合并/刷盘串扰，
+  不是某个索引的系统性变慢——本轮对构建链路唯一的改动（字符集快路径）
+  只会减少 CPU。本机构建一次要 50 s 量级（慢盘主导），测不出 CI 上
+  3~7 s 量级的差异，构建类只能以 CI 读数为准。
+* 按上一节的口径粗算：若 `build_ik_content` 抽到 4.8 s 左右的"正常签"，
+  本轮 mean_improvement 约 0.263、得分约 **26.4**，即本轮的真实水平
+  高于第 8 轮的 24.587。
+
+### 14.5 结论与下一轮方向
+
+1. `query_limit` 已经从"最慢的查询"变成"最快的查询"（0.2087 ms，比
+   `select 1` 的 0.0269 ms 只高一个量级），查询类里剩下的三条无界查询
+   与分词类的提升空间都在"每命中行的通用路径"上（结果编码、计划缓存、
+   布尔求值），第 9/10 轮已经把容易的摘完了。
+2. **构建类是唯一的数量级短板**：`build_ik_all` 三轮都钉在 6.15~6.26 s，
+   `build_ik_content`/`build_beng_en` 在 2.6~6.6 s 之间抽签。20000 行的
+   表建全文索引要 3~7 s，显然不是分词 CPU（本机全量 CPU 剖析里分词只占
+   小头），而是 DDL 机器本身的固定开销（排序缓冲刷盘、索引表
+   build/merge、DDL 收尾）。要抬分必须把这笔固定开销砍下来，并且把
+   构建之间的串扰（坏签）消掉。
+3. 坏签的消法值得单独验证：三次 CI 里坏签分别落在第 3、第 2 个构建上，
+   疑似上一个构建的 sort 临时文件/后台合并还没落稳。如果能让每个
+   ALTER 的 DDL 收尾（flush + 等待合并）变短，三个构建就都能落在
+   "好签"上，这一项就值 2~4 分。

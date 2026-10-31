@@ -1,0 +1,74 @@
+# owner: fts perf
+# description: MATCH used only as a filter with LIMIT no longer gets the implicit
+#              relevance order (the score magnitude is never read there); the hit
+#              count, the bounded reads and the score visible cases stay correct.
+#              Also covers the utf8mb4_general_ci compare fast path with ASCII,
+#              CJK, mixed, accented and 4 byte strings.
+
+--disable_warnings
+drop database if exists fts;
+create database fts;
+use fts;
+--enable_warnings
+
+create table t_limit_filter(
+  id int primary key,
+  title varchar(128),
+  content varchar(2048),
+  fulltext index i1(title, content) with parser ik);
+
+insert into t_limit_filter values
+ (1,'数据库性能优化实践','全文索引的分词器热路径优化包括解析器实例复用、停用词全局单例'),
+ (2,'全文索引分词器热路径分析','ik 分词需要频繁查词典和判断停用词，CPU 开销集中在分词热路径'),
+ (3,'OceanBase 稳定性的工程经验','OceanBase 是一款非常稳定的数据库，支持多种内置分词器'),
+ (4,'倒排索引与检索系统设计','倒排索引是全文检索的核心数据结构，分词质量直接影响召回率'),
+ (5,'中文分词 ik 词典加载机制','全文索引需要高效的分词器，分词器的词典加载是关键路径'),
+ (6,'搜索引擎召回率调优笔记','全文检索系统需要平衡召回率和查询延迟'),
+ (7,'分布式存储 compaction 策略','存储层的归并策略影响索引构建速度'),
+ (8,'SQL 执行计划与索引选择','全文索引的查询计划依赖代价模型');
+
+# the count over a bounded subquery is the number of matched rows capped at the limit
+select count(*) from (select id from t_limit_filter where match(title, content) against('全文索引 分词器') limit 20) t;
+select count(*) from (select id from t_limit_filter where match(title, content) against('全文索引 分词器') limit 4) t;
+select count(*) from (select id from t_limit_filter where match(title, content) against('全文索引 分词器') limit 2) t;
+select count(*) from (select id from t_limit_filter where match(title, content) against('全文索引 分词器') limit 1) t;
+
+# bounded read without the score keeps returning matched rows
+select count(*) from (select id from t_limit_filter where match(title, content) against('全文索引 分词器') limit 3) t;
+
+# a bounded read without the score still returns matched rows
+select id from t_limit_filter where match(title, content) against('全文索引 分词器') limit 3;
+
+# bounded read with the score selected keeps the implicit relevance order
+select id, match(title, content) against('全文索引 分词器') as score
+ from t_limit_filter where match(title, content) against('全文索引 分词器') limit 2;
+
+# explicit ORDER BY on the score is unaffected
+select id, match(title, content) against('全文索引 分词器') as score
+ from t_limit_filter where match(title, content) against('全文索引 分词器')
+ order by score desc, id limit 3;
+
+# unbounded reads keep the implicit relevance order
+select id, match(title, content) against('全文索引 分词器') as score
+ from t_limit_filter where match(title, content) against('全文索引 分词器');
+
+# ---------------------------------------------------------------
+# utf8mb4_general_ci compare fast path: ASCII folding, CJK code
+# points, mixed strings, accented (two byte), 4 byte emoji.
+# ---------------------------------------------------------------
+create table t_coll(w varchar(64)) default charset utf8mb4;
+insert into t_coll values
+ ('apple'),('Apple'),('APPLE'),('banana'),('数据'),('数据库'),('索引'),
+ ('abc数据'),('ABC数据'),('AbC数据'),('数据abc'),('数据ABC'),
+ ('café'),('straße'),('micro µ test'),('emoji 😀 x'),('emoji x'),
+ ('a b'),('a  b'),('ab '),(' ab'),(''),('x'),('X'),('xyz'),('XyZ');
+
+select w from t_coll order by w;
+select w, count(*) from t_coll group by w order by w;
+select count(*) from t_coll where w = 'APPLE';
+select count(*) from t_coll where w = 'abc数据';
+select count(*) from t_coll where w in ('apple','数据','xyz');
+select count(*) from t_coll where w between 'a' and 'b';
+select min(w), max(w) from t_coll;
+
+drop database fts;
