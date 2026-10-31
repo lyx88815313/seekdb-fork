@@ -2008,6 +2008,22 @@ int ObTableScanOp::get_next_batch_with_das(int64_t &count, int64_t capacity)
 {
   int ret = OB_SUCCESS;
   int64_t batch_size = capacity;
+  // The final limit of this scan is enforced by the operator itself
+  // (need_final_limit_), so the iterator below never has to produce more
+  // rows than the operator can still emit.  Asking for the full rowset first
+  // and shrinking only once the limit is close made every bounded index back
+  // read prefetch a whole lookup batch: a LIMIT 20 on a text retrieval scan
+  // looked up 256 documents and threw 236 of them away.  Capping the request
+  // before the first pull bounds the prefetch to what is still needed; rows
+  // that an operator level filter drops are simply pulled in the next round
+  // of the loops below, which already exist for exactly that case.
+  if (need_final_limit_ && limit_param_.limit_ > 0
+      && output_row_cnt_ + batch_size > limit_param_.limit_) {
+    batch_size = limit_param_.limit_ - output_row_cnt_;
+    if (batch_size < 1) {
+      batch_size = 1;
+    }
+  }
   //it means multi-partition limit pushed down in DAS TSC
   //need to calc final limit row
   while (OB_SUCC(ret) && need_final_limit_ && input_row_cnt_ < limit_param_.offset_) {

@@ -302,11 +302,113 @@ static inline void ob_tosort_unicode(ObUnicaseInfo *uni_plane, ob_wc_t *wc, unsi
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fast path for the utf8mb4 general ci sort order.
+//
+// ob_tosort_unicode() looks the sort weight of every character up in the
+// unicase plane tables.  For two families of characters the weight is known
+// without that walk, and those two families are exactly what the full text
+// index build sorts (ASCII words of the English documents and CJK words of
+// the Chinese documents):
+//
+//   * single byte characters (U+0000..U+007F): every character keeps its code
+//     point as weight except the lower case letters, whose weight is the
+//     upper case letter (see utf8_plane00 in ob_ctype_utf8_tab.h);
+//   * three byte characters whose plane has no table in
+//     ob_unicase_pages_default: the code point is left untouched, so the
+//     weight is the code point itself.  Three byte characters live in planes
+//     0x08..0xFF, and the planes that carry a table there are 0x1E, 0x1F,
+//     0x21, 0x24 and 0xFF.
+//
+// Everything else (two byte characters, four byte characters, the planes with
+// a table, invalid or truncated sequences) is reported as not handled and the
+// caller falls back to the original loop, which recomputes the answer from
+// the beginning of both strings.  The fast path therefore only ever returns
+// a value that the original loop returns as well.
+//
+// The validation mirrors ob_mb_wc_utf8mb4() exactly for the accepted family:
+// the lead byte must be 0xE0..0xEF, two continuation bytes must follow inside
+// the string, and an 0xE0 lead must be followed by 0xA0.. so the sequence is
+// not overlong.  Sequences that ob_mb_wc_utf8mb4() rejects make the helper
+// report "not handled", and the fallback reproduces the original behaviour
+// (the remaining bytes are compared with bincmp_utf8mb4()).
+static inline bool ob_utf8mb4_general_ci_fast_weight(const unsigned char *&p,
+                                                     const unsigned char *end,
+                                                     uint32_t &weight)
+{
+  const unsigned char c = *p;
+  if (c < 0x80) {
+    weight = (c >= 0x61 && c <= 0x7A) ? (uint32_t)(c - 0x20) : (uint32_t)c;
+    p += 1;
+    return true;
+  } else if (c >= 0xE0 && c < 0xF0 && p + 3 <= end
+             && IS_CONTINUATION_BYTE(p[1]) && IS_CONTINUATION_BYTE(p[2])
+             && (c >= 0xE1 || p[1] >= 0xA0)) {
+    const uint32_t wc = (((uint32_t)(c & 0x0F)) << 12)
+                      | (((uint32_t)(p[1] & 0x3F)) << 6)
+                      |  ((uint32_t)(p[2] & 0x3F));
+    const uint32_t plane = wc >> 8;
+    if (OB_UNLIKELY(0x1E == plane || 0x1F == plane || 0x21 == plane
+                    || 0x24 == plane || 0xFF == plane)) {
+      return false;
+    }
+    weight = wc;
+    p += 3;
+    return true;
+  }
+  return false;
+}
+
+enum ObUtf8mb4FastWalkRet
+{
+  OB_FAST_NOT_HANDLED = 0,  // a character outside the family was met
+  OB_FAST_DONE = 1,         // the strings differ, the result is in cmp_ret
+  OB_FAST_TAIL = 2          // the common prefix is equal, the walk pointers are advanced
+};
+
+// Walk the common prefix of both strings over the fast path family.  On
+// OB_FAST_TAIL the walk pointers stand exactly where the original loop would
+// stand when it runs out of characters, so the caller finishes with its own
+// tail rule (length difference for strnncoll, trailing space rule for
+// strnncollsp).
+static inline ObUtf8mb4FastWalkRet
+ob_utf8mb4_general_ci_fast_prefix(const unsigned char *&s, const unsigned char *se,
+                                  const unsigned char *&t, const unsigned char *te,
+                                  int &cmp_ret)
+{
+  uint32_t sw = 0;
+  uint32_t tw = 0;
+  while (s < se && t < te) {
+    if (!ob_utf8mb4_general_ci_fast_weight(s, se, sw)
+        || !ob_utf8mb4_general_ci_fast_weight(t, te, tw)) {
+      return OB_FAST_NOT_HANDLED;
+    }
+    if (sw != tw) {
+      cmp_ret = sw > tw ? 1 : -1;
+      return OB_FAST_DONE;
+    }
+  }
+  return OB_FAST_TAIL;
+}
+
 static int ob_strnncoll_utf8mb4(const ObCharsetInfo *cs,
                      const unsigned char *src, size_t srclen,
                      const unsigned char *dst, size_t dstlen,
                      bool t_is_prefix)
 {
+  if (OB_LIKELY(cs->caseinfo == &ob_unicase_default)) {
+    const unsigned char *s = src;
+    const unsigned char *t = dst;
+    const unsigned char *se = src + srclen;
+    const unsigned char *te = dst + dstlen;
+    int fast_ret = 0;
+    const ObUtf8mb4FastWalkRet walk = ob_utf8mb4_general_ci_fast_prefix(s, se, t, te, fast_ret);
+    if (OB_FAST_DONE == walk) {
+      return fast_ret;
+    } else if (OB_FAST_TAIL == walk) {
+      return (int) (t_is_prefix ? (t - te) : ((se - s) - (te - t)));
+    }
+  }
   ob_wc_t src_wc = 0, dst_wc = 0;
   const unsigned char *se = src + srclen;
   const unsigned char *te = dst + dstlen;
@@ -377,6 +479,26 @@ static int ob_strnncollsp_utf8mb4(const ObCharsetInfo *cs,
                        const unsigned char *dst, size_t dstlen,
                        bool diff_if_only_endspace_difference)
 {
+  if (OB_LIKELY(cs->caseinfo == &ob_unicase_default)) {
+    const unsigned char *s = src;
+    const unsigned char *t = dst;
+    const unsigned char *se = src + srclen;
+    const unsigned char *te = dst + dstlen;
+    int fast_ret = 0;
+    const ObUtf8mb4FastWalkRet walk = ob_utf8mb4_general_ci_fast_prefix(s, se, t, te, fast_ret);
+    if (OB_FAST_DONE == walk) {
+      return fast_ret;
+    } else if (OB_FAST_TAIL == walk) {
+      int res = 0;
+      int has_returned = 0;
+      int tmp = ob_strnncollsp_utf8mb4_help(
+          &s, (size_t)(se - s),
+          &t, (size_t)(te - t),
+          &se, &te,
+          diff_if_only_endspace_difference, &has_returned, &res);
+      return has_returned ? tmp : res;
+    }
+  }
   int res;
   ob_wc_t src_wc = 0, dst_wc = 0;
   const unsigned char *se= src + srclen, *te= dst + dstlen;

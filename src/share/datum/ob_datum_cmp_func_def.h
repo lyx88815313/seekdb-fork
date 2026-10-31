@@ -376,8 +376,25 @@ struct ObDatumStrCmpImpl
   static int OB_INLINE cmp(const ObDatum &l, const ObDatum &r, int &cmp_ret,
                            const ObCollationType cs, const bool with_end_space)
   {
-    cmp_ret = ObCharset::strcmpsp(cs, l.ptr_, l.len_, r.ptr_, r.len_, with_end_space);
-    cmp_ret = cmp_ret > 0 ? 1 : (cmp_ret < 0 ? -1 : 0);
+    if (OB_LIKELY(common::CS_TYPE_BINARY == cs)) {
+      // The binary collation handler is ob_strnncollsp_binary(), which
+      // compares the common prefix with memcmp and breaks the tie with the
+      // length difference; the end space flag is ignored there.  The collation
+      // is a template parameter at every call site, so the comparison is
+      // spelled out here instead of going through the charset dispatch, which
+      // validates the arguments and looks the charset up again on every rowkey
+      // compare of an index back scan.  The result is normalized exactly like
+      // the original: positive to 1, negative to -1, zero to 0.
+      const int64_t min_len = MIN(l.len_, r.len_);
+      const int mem_cmp = (min_len > 0) ? memcmp(l.ptr_, r.ptr_, static_cast<size_t>(min_len)) : 0;
+      const int raw_ret = (0 == mem_cmp)
+          ? static_cast<int>(static_cast<size_t>(l.len_) - static_cast<size_t>(r.len_))
+          : mem_cmp;
+      cmp_ret = raw_ret > 0 ? 1 : (raw_ret < 0 ? -1 : 0);
+    } else {
+      cmp_ret = ObCharset::strcmpsp(cs, l.ptr_, l.len_, r.ptr_, r.len_, with_end_space);
+      cmp_ret = cmp_ret > 0 ? 1 : (cmp_ret < 0 ? -1 : 0);
+    }
     return OB_SUCCESS;
   }
 };

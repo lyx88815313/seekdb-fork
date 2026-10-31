@@ -263,9 +263,21 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         reset_lookup_state();
         int64_t storage_count = 0;
         int64_t index_capacity = 0;
-        while (OB_SUCC(ret) && !index_end_ && lookup_rowkey_cnt_ < default_batch_row_count_) {
+        // The caller shrinks its request to what it still needs: a table scan
+        // that keeps the final limit on the operator level asks for
+        // `limit - output rows` rows per batch (see ObTableScanOp, the
+        // need_final_limit_ path).  The collection loop used to fill the
+        // whole lookup batch regardless of that, which turned a bounded read
+        // of a few rows into a full batch of rowkey lookups: a LIMIT 20 on
+        // the text retrieval scan looked up 256 documents and threw 236 of
+        // them away.  Collecting more candidates than the caller asked for
+        // is only a prefetch, so the loop also stops at the caller's
+        // capacity now.  Unbounded scans ask for the full rowset and are not
+        // affected.
+        const int64_t collect_cnt = MAX(int64_t(1), MIN(default_batch_row_count_, capacity));
+        while (OB_SUCC(ret) && !index_end_ && lookup_rowkey_cnt_ < collect_cnt) {
           storage_count = 0;
-          index_capacity = std::min(capacity, std::min(max_size_, default_batch_row_count_ - lookup_rowkey_cnt_));
+          index_capacity = std::min(capacity, std::min(max_size_, collect_cnt - lookup_rowkey_cnt_));
           index_table_iter_->clear_evaluated_flag();
           if (OB_FAIL(index_table_iter_->get_next_rows(storage_count, index_capacity))) {
             if (OB_UNLIKELY(OB_ITER_END != ret)) {

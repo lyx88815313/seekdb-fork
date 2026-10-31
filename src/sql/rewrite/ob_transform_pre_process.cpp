@@ -3937,12 +3937,38 @@ int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, b
     }
   }
   if (OB_SUCC(ret) && nullptr != match_expr && !static_cast<ObMatchFunRawExpr*>(match_expr)->is_es_match()) {
-    OrderItem item(match_expr, default_desc_direction());
-    if (OB_FAIL(stmt->add_order_item(item))) {
-    } else {
-      trans_happened = true;
+    // The implicit relevance order is a presentation nicety: SQL promises no
+    // row order without an explicit ORDER BY.  With a LIMIT it costs the full
+    // BM25 pass over every matched document only to discard all but a few
+    // rows, and the score magnitude is never read when the score is not part
+    // of the result.  Keep the implicit order when the user selected the
+    // score (the result shows relevance, so the rows have to be the top
+    // ones), otherwise drop it for bounded reads and let the plan stop at
+    // the limit.  An explicit `ORDER BY MATCH(...) DESC LIMIT n` is not
+    // affected: the top guard already skips statements with an ORDER BY.
+    bool inject_relevance_order = true;
+    if (stmt->is_select_stmt() && stmt->has_limit()) {
+      ObSEArray<ObRawExpr *, 16> select_exprs;
+      if (OB_FAIL(static_cast<ObSelectStmt *>(stmt)->get_select_exprs(select_exprs))) {
+      } else {
+        inject_relevance_order = false;
+        for (int64_t i = 0; i < select_exprs.count(); ++i) {
+          if (OB_NOT_NULL(select_exprs.at(i))
+              && select_exprs.at(i)->has_flag(CNT_MATCH_EXPR)) {
+            inject_relevance_order = true;
+            break;
+          }
+        }
+      }
     }
-  } 
+    if (OB_SUCC(ret) && inject_relevance_order) {
+      OrderItem item(match_expr, default_desc_direction());
+      if (OB_FAIL(stmt->add_order_item(item))) {
+      } else {
+        trans_happened = true;
+      }
+    }
+  }
   return ret;
 }
 
