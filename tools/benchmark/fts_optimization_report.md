@@ -11,6 +11,7 @@
 > * `perf(fts): look the dictionary word up once per dict and drop the libc memcpy from the hash`（第七轮）
 > * `perf(fts): compute the data plane page checksum eight bytes at a time`（第八轮）
 > * `perf(fts): compute the data plane page checksum with the crc32 instruction`（第九轮）
+> * `perf(fts): look the dictionary code up without a call into libc`（第十轮）
 >
 > 数据采集环境：WSL Ubuntu 24.04（4 核 / 11 GB），使用仓库自带的
 > `tools/benchmark/fts_large_bench.sh`，参数与 CI 一致：
@@ -20,13 +21,15 @@
 > 第三轮为了压低测量噪声，另加了一层**测量协议**（静默等待 + ABBA 交错 + 重复跑测），
 > 详见第 7 章。**基准脚本本身没有做任何修改。**
 >
-> **当前状态（截至第 9 轮）**：第 8 轮的 CI 权威读数是 `fts_raw_score` = **49.71**
+> **当前状态（截至第 10 轮）**：第 8 轮的 CI 权威读数是 `fts_raw_score` = **49.71**
 > （`fts_mean_improvement` = 24.86%），分项为构建 **+16.63%** / 分词 **+24.57%** /
 > 查询 **+33.37%**。第 9 轮把构建链路的页校验和换成 CPU 指令
-> （数值逐位不变），CI 结果待回收。
-> 九轮改动覆盖构建、分词、查询三条链路，命中数（8001 / 11000 / 7332 / 20）
+> （数值逐位不变），第 10 轮把分词链路的逐字符词典查找上的三次 libc 调用去掉，
+> 两轮的 CI 结果都待回收。
+> 十轮改动覆盖构建、分词、查询三条链路，命中数（8001 / 11000 / 7332 / 20）
 > 与 TOKENIZE 输出始终与基线一致。
-> CI 得分结构见 9.7，第 8 轮的 CI 结果与预测复核见 11.5，第 9 轮见 12。
+> CI 得分结构见 9.7，第 8 轮的 CI 结果与预测复核见 11.5，第 9 轮见 12，
+> 第 10 轮见 13。
 
 ---
 
@@ -2588,6 +2591,7 @@ Rust 一侧**。
 | 四个 MATCH 命中数 | **一致**：8001 / 11000 / 7332 / 20 |
 | MATCH 有序结果 + BM25 分数 | **逐行一致**（8052 行） |
 | 索引内容指纹 | **一致**：`20000 / SUM(CRC32(word)) = 43236786491121 / 5832098` 字节 |
+| 受控重建后的索引指纹（第 9 轮二进制上删掉 3 个索引再按序重建） | **仍然是 `20000 / 43236786491121 / 5832098`**，与第 8 轮臂逐位一致 |
 | 布尔模式命中数 | 一致 |
 | 仓库静态检查（`tools/module_check/*`、`tools/bazel_migration/source_input_check.py`，12 项） | **12 过 0 败** |
 | `cargo clippy --workspace --all-targets -- -D warnings`（Rust CI 的门禁） | **rc=0，零告警** |
@@ -2664,7 +2668,50 @@ DDL 超时，一个是这台机器没有 `admin` 账号。
 所以单次 CI 的读数可能落在 51 ~ 59 之间。**权威结论以 CI 的 `fts_raw_score` 为准**，
 本报告只给出预测。
 
-#### 12.7.3 CI 结果
+#### 12.7.3 本地实测：校验和从 11.03% 降到 2.51%
+
+预测不能替代测量，所以对第 9 轮的二进制又做了一次**完全相同**的构建链路剖析：
+同一个脚本、同样的 900 秒采样窗口、同样的"建 3 个索引再删掉"、**同一个解析器**
+（`verify_profiles.py` / `leaf_by_module.py`）。
+
+| | 第 8 轮二进制 | 第 9 轮二进制 |
+| --- | --- | --- |
+| 采样栈总数 | 142310 | 130715 |
+| depth=1 的栈占比 | 6.13% | 6.59% |
+| **页校验和占全部叶子时间的比例** | **11.03%**（`kv::page::checksum`，15695 个） | **2.51%**（`kv::page::checksum_sse42`，3276 个） |
+
+**11.03% → 2.51%**：校验和现在只占构建叶子时间的四分之一不到，只剩原来的 **23%**。
+
+这个实测和预测是对得上的：微基准说硬件路径快 5.46 倍，那么 11.03% / 5.46 = **2.02%**，
+实测 **2.51%**。两者的差距（0.5 个百分点）来自**两次采样的后台归并量不同**
+（第 8 轮那个窗口里夹着一次 664 个 tablet 的全局归并，见 11.4.3），
+所以绝对比例对不齐是正常的，**数量级和方向完全一致**。
+
+顺带得到的是**新一轮的热点分布**（第 9 轮二进制的符号级叶子归因）：
+
+| 叶子符号 | 第 8 轮 | 第 9 轮 | 说明 |
+| --- | --- | --- | --- |
+| libc（memcpy/memmove 等） | 12.93% | 13.15% | 基本没变，**搬数据**而不是算数据 |
+| `kv::page::checksum_sse42` | 11.03% | **2.51%** | 本轮压下去的那一块 |
+| `ObNullSafeDatumStrCmp<45>` | 3.46% | 4.48% | utf8mb4_general_ci 权重比较 |
+| `ob_strnncollsp_utf8mb4` | 2.17% | 2.40% | 同上 |
+| `ob_mb_wc_utf8mb4` | 1.44% | 1.67% | 同上 |
+| `ObCharset::strcmpsp` | 0.95% | 1.08% | 同上 |
+| `ObCharset::is_argument_valid` | 0.80% | 1.01% | 同上 |
+| `ObCharset::get_charset` | 0.82% | 0.91% | 同上 |
+| **字符集比较合计** | **9.64%** | **11.55%** | **现在是最大的一块可动目标** |
+| `ObIArrayWrap<void*>::at` | 1.90% | 2.08% | 框架 |
+| `ObOperator::get_next_batch` | 1.63% | 1.73% | 框架 |
+| `<kv::Shared>::node` | 1.52% | 1.67% | 校验和之外剩下的解码工作 |
+| `ObSortOpImpl::Compare::operator()` | 1.45% | 1.59% | PX 排序 |
+| `ZSTD_compressBlock_fast` | 1.39% | 1.54% | 压缩 |
+| `crc64_sse42` | 0.93% | 0.98% | C++ 侧硬件 CRC |
+
+注意**字符集那一组占比反而变大了**（9.64% → 11.55%）——这不是它变慢了，
+而是分母里被校验和让出来的那一大块不见了。**它现在是构建链路里最大的一块
+可动目标**，但它同时是 MATCH 大小写不敏感语义的地基。
+
+#### 12.7.4 CI 结果
 
 **待回收。** 这一轮的 CI 读数由用户/组织方回贴后补进本节。
 
@@ -2689,21 +2736,23 @@ DDL 超时，一个是这台机器没有 `admin` 账号。
 
 **(a) 构建链路：校验和只剩约 2%。**
 
-硬件路径把校验和从 11.03% 压到约 2%，构建链路的叶子分布会再次洗牌：
+硬件路径把校验和从 11.03% 压到 **2.51%**（12.7.3 实测），构建链路的叶子分布已经洗牌：
 
 | 下一批热点 | 占构建叶子时间 | 性质 | 可动性 |
 | --- | --- | --- | --- |
-| libc（memcpy/memmove 等） | 12.93% | 运行时 | 低，通常是**搬数据**而不是算数据 |
-| `ObNullSafeDatumStrCmp<45>` + `ob_strnncollsp_utf8mb4` + `ob_mb_wc_utf8mb4` + `ObCharset::strcmpsp` | 约 7.9% | utf8mb4_general_ci 权重比较 | **oblib 共享层，而且会碰到 MATCH 的大小写不敏感语义** |
+| libc（memcpy/memmove 等） | 13.15% | 运行时 | 低，通常是**搬数据**而不是算数据 |
+| **字符集比较一组**（`ObNullSafeDatumStrCmp<45>` + `ob_strnncollsp_utf8mb4` + `ob_mb_wc_utf8mb4` + `ObCharset::strcmpsp` + `ObCharset::is_argument_valid` + `ObCharset::get_charset`） | **11.55%** | utf8mb4_general_ci 权重比较 | **oblib 共享层，而且会碰到 MATCH 的大小写不敏感语义** |
+| `kv::page::checksum_sse42` | 2.51% | 页校验和（硬件指令） | 已经很干净了 |
 | `ObIArrayWrap<void*>::at` | 1.90% | 框架 | 低 |
 | `ObOperator::get_next_batch` | 1.63% | 框架 | 低 |
 | `ObSortOpImpl::Compare::operator()` | 1.45% | PX 排序 | 中 |
 | `ZSTD_compressBlock_fast` | 1.39% | 压缩 | 低 |
 | `crc64_sse42` | 0.93% | C++ 侧硬件 CRC | 已有 |
 
-字符集比较那一块加起来接近 8%，但它同时是 **MATCH 语义的地基**
-（`utf8mb4_general_ci` 不区分大小写），动它必须同时证明检索结果不变；
-libc 那 12.93% 大概率是数据搬运，不是可以省掉的工作。
+字符集比较那一块现在是 **11.55%**，是构建链路里最大的一块可动目标，
+但它同时是 **MATCH 语义的地基**（`utf8mb4_general_ci` 不区分大小写），
+动它必须同时证明检索结果不变；libc 那 13.15% 大概率是数据搬运，
+不是可以省掉的工作；校验和已经只剩 2.51%，没什么可再压的了。
 **所以构建链路剩下的空间，本质上是一次"要不要碰共享存储层和字符集"的抉择。**
 
 **(b) 查询侧：`query_limit` 的差距是真的 BM25 计算，不是无用开销。**
@@ -2719,4 +2768,235 @@ libc 那 12.93% 大概率是数据搬运，不是可以省掉的工作。
 `tokenize_beng` 因为往返开销占比太大，改进率上限只有 42.5%；空间主要在
 `tokenize_ik`。下一轮要做分词，得先对**当前**二进制的分词链路重新做一次
 符号级归因——第 7 轮的那份剖析已经隔了两轮改动。
+
+## 13. 第 10 轮：把分词热路径上的词典查找从 libc 调用里拿出来
+
+### 13.1 先量后改：按**官方口径**重新剖析三条链路
+
+#### 13.1.1 第 7 轮那份分词剖析不能再用了
+
+第 7 轮的分词剖析是**每条 SQL 新开一个 mysql 连接**跑的。第 9 轮重做剖析时
+才发现，这个口径把连接握手算进了分词链路：按符号名统计时，
+`ObMPConnect::process()` 的 inclusive 占比是 **31.43%**，
+`verify_identify` 28.44%、`load_privilege_info` 28.21%、
+`ObBasicSessionInfo::load_all_sys_vars` 25.41% —— 这些全是**连接建立**的开销，
+而真正的分词只有 `ObExprTokenize::eval_tokenize` 11.05%。
+
+官方基准（`tools/benchmark/fts_large_bench.sh` 的 `run_repeated_sql_bench`）
+的口径完全不同：
+
+```bash
+write_session_header "${sample_file}"     # SET NAMES utf8mb4 / ob_query_timeout / ob_trx_timeout
+append_repeated_sql "${sample_file}" "${ROUNDS}" "${sql}"   # ROUNDS=3000 条同一条 SQL
+start_ns=$(now_ns); $MYSQL < "${sample_file}" >/dev/null; end_ns=$(now_ns)
+avg_ms = (end_ns - start_ns) / ROUNDS
+```
+
+也就是**一个 sample 只开一次连接**，3000 条 SQL 喂进同一个连接，
+`avg_ms` 是整个 mysql 进程的墙钟除以轮数。握手开销被摊薄到 1/3000，
+在官方口径下**根本不该出现**。
+
+所以第 10 轮的第一件事不是改代码，而是**把三条链路按官方口径重新剖析一遍**。
+
+#### 13.1.2 剖析方法
+
+* **分词链路**（`perf_tokenize_r10b.sh`）：一个 mysql 进程、一个连接、
+  同样的会话头、同样的 `IK_TEXT`，用一条管道持续喂 3000 条同一条 SQL 的循环，
+  让负载覆盖整个 120 秒采样窗口（第一版用文件喂，客户端 54 秒就跑完了，
+  剩下 60 秒服务端空闲，采样会被稀释，所以改成管道）。
+* **查询链路**（`perf_query_r10.sh`）：同样的口径，把官方基准里的**四条**查询
+  按顺序不断重复。
+* **构建链路**：沿用第 8/9 轮的做法（建索引 + 删索引，900 秒窗口），
+  因为它本来就是后台任务驱动、没有连接口径的问题。
+
+解析器也一起修了：第 9 轮的归因脚本把**所有**帧都拿 seekdb 的符号表去解析，
+而 perf 栈里混着 `libc.so.6` 的帧，于是 libc 的地址被解析成了 seekdb 里
+碰巧排在下方的符号（本轮实测把 13.73% 的 libc 字符串函数误认成了
+`absl::LowLevelAlloc::Alloc`）。第 10 轮的解析器**按帧所属的 DSO 分别解析**，
+libc 用 `nm -D` 的动态符号表。
+
+#### 13.1.3 分词语句的归因（官方口径，8530 个采样栈）
+
+| 叶子 / 归因块 | 占全部采样 | 说明 |
+| --- | --- | --- |
+| `ObFTDATReader::find_code` | **5.72%** | 逐字符查词典的 code |
+| `ObFTCacheDict::match_with_code` | **3.81%** | DAT 双数组 trie 走一步 |
+| `ObFTRangeDict::find_first_char_range` | 1.47% | 二分查找词所属的词典区间 |
+| `ObFTCacheDict::match` | 1.23% | 查词 + 走 trie |
+| **词典查找合计** | **12.23%** | 全部落在 `do_process` → `process_next_batch` → `get_next_token` → `segment` 下 |
+| `ObExprTokenize::eval_tokenize`（inclusive） | 41.44% | 真正的分词工作 |
+| `ObJsonExprHelper::pack_json_res`（inclusive） | 3.22% | DOM → ObJsonBin → 二进制 |
+| `ObIJsonBase::print`（inclusive） | 7.10% | 结果行编码时把二进制再解析回文本 |
+| `ObSql::stmt_query`（inclusive） | 10.15% | SQL 解析 + 计划缓存 |
+| libc 字符串函数（memcpy/memset/memcmp 一族） | **13.73%** | 其中 32.02% 在 `eval_tokenize` 下 |
+
+inclusive 里的框架开销：`ObMPQuery::process` 74.43%、
+`response_result` 54.48%、`stmt_query` 10.15%、
+`append_response` 7.70%、`pc_get_plan` 7.02%。
+**分词语句里有 58.56% 根本不是分词**（SQL 解析、计划缓存、结果编码、IO）。
+
+#### 13.1.4 查询与构建链路：剩下的热点都在不能动的地方
+
+| 链路 | 最大的叶子 | 能不能动 |
+| --- | --- | --- |
+| 查询 | `ObStringDiffDecoder::batch_decode` **6.69%** | **不能**：作业明令避免的共享存储层改动 |
+| 查询 | `ObSimpleRowsMerger` 系列 7.82%、`ObSRMergeCmp::cmp` 3.18%、`ObSRDaaTIterImpl` 9.98% | 稀疏检索的归并机制，改动面极大 |
+| 查询 | `ObExprBM25::eval_batch_bm25_relevance_expr` 1.42% | BM25 本身 |
+| 构建 | `ObNullSafeDatumStrCmp<45>` + 字符集比较一组 **13.5%** | **不能**：排序键用 `utf8mb4_general_ci`，动了就改了 MATCH 的大小写不敏感语义 |
+| 构建 | `kv::page::checksum_sse42` 2.51% | 第 9 轮已经压过 |
+| 构建 | `ObFTIndexRowCache::segment` 10.04% | 索引构建时的分词 —— **这一轮动的是它** |
+
+查询链路的 `ObStringDiffDecoder::batch_decode` 和构建链路的字符集比较，
+都是作业点名/语义锁死的。**剩下的、既能改又能证明等价的，只有分词链路
+自己那 12.23% 的词典查找。**
+
+### 13.2 本轮改了什么
+
+分词热路径上，每匹配一个字符、每本词典，就要做一次词典查找。
+这条路上原本有**三次进 libc 的调用**：
+
+1. `ObFTSingleWord::set_word()`：`memcpy(word, len)` 拷贝词 +
+   `memset()` 清零尾部。长度是运行期的，所以两次都是**函数调用**。
+2. `ObArrayHashMap::find()` 的桶内比较：`memcmp(word, other.word, word_len)`，
+   又是**一次函数调用**。
+
+也就是说，**一个字符一次词典查找 = 3 次 libc 调用**。
+
+按调用方把这 13.73% 的 libc 叶子拆开，落在词典查找这条路上的有
+**152 个采样**（`ObIKCJKProcessor::do_process` 51 + `ObFTCacheDict::match` 34 +
+`ObFTRangeDict::match` 67），占 libc 叶子总数的 **12.98%**，
+折合分词语句的 **1.78%**；再加上区间字典二分查找里的 `memcmp`，
+这一轮去掉的就是这一块。
+
+#### 13.2.1 `ObArrayHashMap::find()` 增加按原始字节的重载
+
+`src/storage/fts/dict/ob_ft_dat_dict.h`
+
+词典 map 的哈希是**对整个定长缓冲区**算的（`hash_single_word` 里
+`MEMCPY(&chunk, word.word, sizeof(word.word))`，`ObCharset::MAX_MB_LEN` = 5 字节，
+词后面的字节恒为 0）。所以：
+
+* 一个词**按原始字节**算出来的 chunk，和把它装进 `ObFTSingleWord` 之后的 chunk
+  **逐位相同**；
+* 两个词的比较，`memcmp` 比的是 `word_len` 个字节，而定长缓冲区里词后面的字节
+  恒为 0，所以**比较整个缓冲区等价于比较词本身**。
+
+于是新增的重载直接用原始字节算哈希、比较桶：
+
+```cpp
+int find(const char *ptr, const int32_t len, ObFTWordCode &code) const
+{
+  int ret = OB_ENTRY_NOT_EXIST;
+  if (OB_LIKELY(len >= 0 && len <= static_cast<int32_t>(sizeof(ObFTSingleWord::word)))) {
+    const uint64_t chunk = load_word_bytes(ptr, len);
+    ...
+      if (entry.word.word_len == len && load_word_buffer(entry.word) == chunk) {
+```
+
+**哈希值逐位不变**，所以桶布局不变、`next_code_` 的分配顺序不变、
+DAT 的 code 空间不变 —— **索引内容不变**。
+
+#### 13.2.2 `ObFTSingleWord::set_word()` / `operator==` 不再进 libc
+
+`src/storage/fts/dict/ob_ft_dict_def.cpp`
+
+* `set_word()`：用一次循环把词装进一个 64 位 chunk（尾部天然是 0），
+  再 `MEMCPY` 5 个字节进定长缓冲区 —— 一次定长拷贝，编译器展开成指令，
+  没有函数调用。
+* `operator==()`：两次定长 `MEMCPY`（5 字节）后用掩码截出 `word_len` 个字节比较，
+  和 `memcmp(word, other.word, word_len)` **完全等价**，但没有函数调用。
+  （掩码这一步是刻意加的：这样即使缓冲区尾部有残留字节，行为也和
+  原来的 `memcmp` 一样，不依赖"尾部恒为 0"这个前提。）
+
+#### 13.2.3 区间字典的二分查找也不再进 libc
+
+`src/storage/fts/dict/ob_ft_range_dict.cpp` 的 `ft_bin_strcmp()` 原本用
+`memcmp` 比较两个单字符（长度是运行期的 → 又是函数调用）。
+它被 `find_first_char_range()` 的二分查找调用，**每个词一次查找、
+每次查找 log2(区间数) 次比较**。改成逐字节比较，语义不变
+（仍然是"先比字节、再比长度差"，与 `ob_strnncoll_mb_bin` 一致）。
+
+### 13.3 等价性是怎么证明的
+
+| 改动 | 等价性依据 |
+| --- | --- |
+| `find(ptr, len)` 的哈希 | `load_word_bytes(ptr, len)` 得到的 chunk 与 `load_word_buffer(ObFTSingleWord)` 得到的 chunk 逐位相同（词后面的字节恒为 0），因此哈希值、桶位置、探测序列全部不变 |
+| `find(ptr, len)` 的比较 | `word_len` 相等且两个定长缓冲区的 `word_len` 字节相同 ⟺ 原来的 `memcmp(word, other.word, word_len) == 0` |
+| `set_word()` | 写入的 5 字节缓冲区与原来 `memcpy` + `memset` 的结果逐字节相同 |
+| `operator==()` | 掩码后比较的正是 `word_len` 个字节，与 `memcmp` 的语义和返回值符号一致 |
+| `ft_bin_strcmp()` | 逐字节比较返回第一个不同字节的差值（无符号），相等时返回长度差，与 `memcmp` + 长度差的组合一致 |
+
+另外三条硬约束在验证里逐条查过：
+
+* **TOKENIZE 逐字节一致**：固定文本集的输出两臂 `diff` 为空；
+* **MATCH 命中数不变**：8001 / 11000 / 7332 / 20；
+* **索引内容不变**：索引隐藏列的 `CRC32` 求和、行数、字节数一致。
+
+### 13.4 正确性验证
+
+| 检查项 | 第 9 轮臂 (10103) | 第 10 轮臂 (10104) | 结论 |
+| --- | --- | --- | --- |
+| TOKENIZE 输出（固定文本集，121 行） | 见 `/tmp/verify_r10/tokenize_A.txt` | 见 `/tmp/verify_r10/tokenize_B.txt` | **逐字节一致** |
+| MATCH 命中数（4 条官方查询） | 8001, 11000, 7332, 20 | 8001, 11000, 7332, 20 | **一致** |
+| MATCH 有序结果行 + BM25 分数 | 见 `rows_A.txt` | 见 `rows_B.txt` | **逐行一致** |
+| 索引内容指纹（行数 / CRC32 和 / 字节数） | `20000	43236786491121	5832098` | `20000	43236786491121	5832098` | **一致** |
+| 索引 doc id 列的字节数 | 320000 | 320000 | **一致** |
+
+两个臂的索引隐藏列名（`cols`）只差 DDL 里的序号后缀；doc id 列的首值是存储层
+发出来的内部行标识的基准值，取决于发号器之前发过多少号，**本来就不可比**
+（比的是长度和形状）。除这两项之外，两臂的索引内容完全一致。
+
+
+### 13.5 性能
+
+**tokenize_ik**（官方口径：单连接 + 会话头 + 8 个样本，ABBA 交错）
+
+| 臂 | 样本数 | 平均 (ms/条) | 中位数 (ms/条) | 标准差 |
+| --- | --- | --- | --- | --- |
+| A：第 9 轮二进制 (10103) | 16 | 0.3035 | 0.2975 | 0.0268 |
+| B：第 10 轮二进制 (10104) | 16 | 0.3066 | 0.3080 | 0.0307 |
+
+* 平均比 B/A = **1.0103**（B 比 A 快 **-1.03%**）
+* 中位数比 B/A = 1.0353
+* 按轮配对的比值：均值 1.0145，标准差 0.1044
+
+
+**本机测不出这一轮的效果，原因是噪声远大于信号。** 上表的配对比值标准差是
+6%~10%，而这一轮按剖析占比推算的效应只有分词语句的 ~1.8%（libc 调用占
+13.73% 的 libc 叶子中的 12.98%）。两次 ik 的测量连**符号都不一致**
+（一次中位数比 0.9963、一次 1.0353），beng 的配对比值 0.9099 ± 0.0632。
+按 95% 置信区间算，本机根本分辨不出 1% 量级的差异。
+
+本机更测不出的原因是**分母不对**：本机一条 `SELECT tokenize(...)` 要 0.28 ms，
+而 CI 上只要 0.057 ms，本机多出来的部分是 mysql 客户端的往返和慢盘，
+分词本身在总时间里占的比例比 CI 更小，信号被埋得更深。
+
+所以这一轮的**性能读数只能由 CI 给**（CI 的分词类噪声远小于本机：
+第 8 轮两次 `tokenize_ik` 的差在千分位）。本机只用来证明两件事：
+**输出等价**（见上表）和**改动确实落在剖析指出的热点上**。
+
+
+### 13.6 结论与下一轮的方向
+
+1. **这一轮先把口径修对了**：第 7 轮那份分词剖析是"每条 SQL 开一个连接"
+   跑的，把连接握手算进了分词链路（`ObMPConnect::process` 占 31.43%）；
+   官方基准是**一个 sample 只开一次连接**，握手开销被摊薄到 1/3000。
+   三条链路按官方口径重剖析之后，"分词还剩多少空间"这个问题才第一次有
+   可靠的答案。归因脚本也一起修了：perf 栈里混着 libc 的帧，
+   用 seekdb 的符号表去解析 libc 的地址会得到完全错误的结论。
+2. **分词链路里剩下的、fulltext 自己拥有的最大块是词典查找（12.23%）**，
+   这一轮把这条路上的三次 libc 调用去掉。改动在 fulltext 存储层，
+   哈希值逐位不变，桶布局不变，索引内容不变。
+3. **查询和构建链路剩下的热点都在不能动的地方**：查询侧最热的叶子是
+   `ObStringDiffDecoder::batch_decode`（6.69%），是作业明令避免的共享存储层改动；
+   构建侧最热的是 PX 排序里的 `utf8mb4_general_ci` 权重比较（约 13.5%），
+   动了就改了 MATCH 的大小写不敏感语义。这两块没有做，理由写在这里。
+4. **下一轮的方向**：分词语句里 **58.56% 不是分词**——SQL 解析、计划缓存
+   （`pc_get_plan` 7.02%）、结果编码（`append_response` 7.70%，其中
+   JSON 结果的"二进制再解析回文本"占 7.10%）。JSON 结果那段要动就得动
+   oblib 的公共 JSON 库，和 `batch_decode` 属于同一类风险。
+   在不碰共享层的前提下，分词侧还剩
+   `ObFTParseHelper::init`（每次调用重新解析 parser name，约 0.55%）、
+   `ObIKArbitrator`（4.67%）和 `ObFTWordMap` 的分组统计（约 2.8%）
+   这些可以逐个量、逐个证明的点。
 

@@ -51,10 +51,29 @@ namespace
 // Same result as ObCharset::strcmp(CS_TYPE_UTF8MB4_BIN, l, r): the binary
 // collation compares the bytes first and falls back to the length difference
 // when one string is a prefix of the other. See ob_strnncoll_mb_bin.
+//
+// The bytes are compared without a call into libc.  The length is a
+// variable, so memcmp() would be a call for every comparison, and the
+// comparison is done once per step of the binary search that finds the
+// dictionary of a word, which is done once per word of the text that is
+// tokenized.  The words that are compared are a single character, so the
+// comparison is over a handful of bytes.
 inline int ft_bin_strcmp(const ObString &l, const ObString &r)
 {
   const int64_t min_len = MIN(l.length(), r.length());
-  int cmp_ret = (min_len > 0) ? memcmp(l.ptr(), r.ptr(), static_cast<size_t>(min_len)) : 0;
+  int cmp_ret = 0;
+  if (min_len > 0) {
+    const char *l_ptr = l.ptr();
+    const char *r_ptr = r.ptr();
+    for (int64_t i = 0; i < min_len; ++i) {
+      const int diff = static_cast<int>(static_cast<unsigned char>(l_ptr[i]))
+                       - static_cast<int>(static_cast<unsigned char>(r_ptr[i]));
+      if (0 != diff) {
+        cmp_ret = diff;
+        break;
+      }
+    }
+  }
   if (0 == cmp_ret) {
     cmp_ret = static_cast<int>(l.length() - r.length());
   }

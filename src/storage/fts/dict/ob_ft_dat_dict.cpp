@@ -250,9 +250,10 @@ template <typename DATA_TYPE>
 int ObFTDATReader<DATA_TYPE>::find_code(const ObString &single_word, ObFTWordCode &code) const
 {
   int ret = OB_SUCCESS;
-  ObFTSingleWord word;
-  word.set_word(single_word.ptr(), single_word.length());
-  ret = dat_->get_map()->find(word, code);
+  // The code of a word is looked up once per character and per dictionary of
+  // the text that is tokenized, so the lookup uses the raw bytes of the word
+  // and does not build an ObFTSingleWord for it.
+  ret = dat_->get_map()->find(single_word.ptr(), static_cast<int32_t>(single_word.length()), code);
   return ret;
 }
 

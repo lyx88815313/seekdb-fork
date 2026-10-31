@@ -73,3 +73,39 @@ select id from tb where match(body) against('全文索引') order by id;
 select id from tb where match(body) against('全文索引 全文检索') order by id;
 select count(*) from tb where match(body) against('全文索引');
 select id from tb where match(body) against('全文索引') order by id limit 1;
+
+# 8) the code of a character is looked up with the raw bytes of the character,
+#    so characters of every byte length have to be found in the dictionary
+#    exactly as before: one byte (ascii), two bytes (latin), three bytes
+#    (cjk) and four bytes (supplementary plane)
+select tokenize('a', 'ik');
+select tokenize('é', 'ik');
+select tokenize('中', 'ik');
+select tokenize('𠀀', 'ik');
+select tokenize('aé中𠀀', 'ik');
+select tokenize('aé中𠀀', 'beng');
+select tokenize('中a中é中𠀀中', 'ik');
+select tokenize('中a中é中𠀀中', 'beng');
+
+# 9) a character that the dictionary does not know is dropped, also when it
+#    has the same first byte as a character that it does know
+select tokenize('中龘', 'ik');
+select tokenize('龘中', 'ik');
+select tokenize('a龘', 'ik');
+select tokenize('龘a', 'ik');
+select tokenize('é龘é', 'ik');
+
+# 10) the same character is looked up again and again, so the lookup has to
+#     return the same code every time
+select tokenize('中中中中中中中中中中', 'ik');
+select tokenize('a a a a a a a a a a', 'ik');
+select tokenize('全文索引全文检索全文优化全文索引', 'ik');
+select tokenize('全文索引全文检索全文优化全文索引', 'ik');
+
+# 11) the dictionary of a word is found with a binary search over the ranges
+#     of the dictionary, so the words at the edges of the ranges have to be
+#     found as well
+select tokenize('龘龤龦龧龨龩', 'ik');
+select tokenize('一丁丂七丄丅丆万丈三上下不与丐丑', 'ik');
+select tokenize('a z A Z 0 9', 'ik');
+select tokenize('a z A Z 0 9', 'beng');

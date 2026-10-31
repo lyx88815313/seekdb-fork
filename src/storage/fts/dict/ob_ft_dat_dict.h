@@ -90,6 +90,46 @@ public:
     return ret;
   }
 
+  // Lookup of a word that is given as raw bytes.
+  //
+  // The hash of a word is computed over the fixed size buffer of an
+  // ObFTSingleWord, whose bytes behind the word are zero (see
+  // ObFTSingleWord::set_word), and the comparison of two words only looks at
+  // the bytes of the word.  A word that is given as raw bytes therefore has
+  // the same hash as the ObFTSingleWord that holds it and compares equal to
+  // exactly the same words, so this lookup returns the same result as the
+  // lookup of the ObFTSingleWord.
+  //
+  // The tokenizer looks a character up in the dictionary once per character
+  // and per dictionary of the text that is tokenized.  Building an
+  // ObFTSingleWord for the lookup costs a call into libc for the copy of the
+  // word and another one for the zeroing of the rest of the buffer, and
+  // comparing the words costs a third one, so the raw bytes are used
+  // directly.
+  int find(const char *ptr, const int32_t len, ObFTWordCode &code) const
+  {
+    int ret = OB_ENTRY_NOT_EXIST;
+    if (OB_LIKELY(len >= 0 && len <= static_cast<int32_t>(sizeof(ObFTSingleWord::word)))) {
+      const uint64_t chunk = load_word_bytes(ptr, len);
+      const uint32_t capacity = header_.capacity_;
+      uint32_t index = hash_index(mix_hash(chunk, len), capacity);
+      while (header_.data[index].used) {
+        const Entry &entry = header_.data[index];
+        if (entry.word.word_len == len && load_word_buffer(entry.word) == chunk) {
+          code = entry.code;
+          ret = OB_SUCCESS;
+          break;
+        } else {
+          index += 3;
+          if (OB_UNLIKELY(index >= capacity)) {
+            index -= capacity;
+          }
+        }
+      }
+    }
+    return ret;
+  }
+
   // Hash of a single word.
   //
   // A word is a single character of at most ObCharset::MAX_MB_LEN bytes, so
@@ -100,9 +140,41 @@ public:
   // into the libc memcpy for every character that is looked up.
   static OB_INLINE uint64_t hash_single_word(const ObFTSingleWord &word)
   {
+    return mix_hash(load_word_buffer(word), word.word_len);
+  }
+
+  // Load the fixed size buffer of a word as a 64 bit chunk.
+  //
+  // The buffer is ObCharset::MAX_MB_LEN bytes long and the chunk is zero
+  // initialized, so the bytes behind the word are zero, exactly like in the
+  // buffer of an ObFTSingleWord.
+  static OB_INLINE uint64_t load_word_buffer(const ObFTSingleWord &word)
+  {
     uint64_t chunk = 0;
     MEMCPY(&chunk, word.word, sizeof(word.word));
-    uint64_t hash = chunk ^ (static_cast<uint64_t>(word.word_len) * 0x9E3779B97F4A7C15ULL);
+    return chunk;
+  }
+
+  // Load the bytes of a word as a 64 bit chunk, zero extended.
+  //
+  // The bytes behind the word are zero in the fixed size buffer of an
+  // ObFTSingleWord, so the chunk of the raw bytes is the chunk of the
+  // ObFTSingleWord that holds them.  The bytes are read one by one because
+  // the length is a variable and a memcpy() of a variable length would be a
+  // call into libc.
+  static OB_INLINE uint64_t load_word_bytes(const char *ptr, const int32_t len)
+  {
+    uint64_t chunk = 0;
+    for (int32_t i = 0; i < len; ++i) {
+      chunk |= static_cast<uint64_t>(static_cast<uint8_t>(ptr[i])) << (8 * i);
+    }
+    return chunk;
+  }
+
+  // Mix the chunk of a word and its length into a hash value.
+  static OB_INLINE uint64_t mix_hash(const uint64_t chunk, const int64_t len)
+  {
+    uint64_t hash = chunk ^ (static_cast<uint64_t>(len) * 0x9E3779B97F4A7C15ULL);
     hash ^= hash >> 29;
     hash *= 0xBF58476D1CE4E5B9ULL;
     hash ^= hash >> 32;
