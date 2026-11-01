@@ -38,6 +38,7 @@ public:
   ~ObFTWord() = default;
 
   OB_INLINE const ObDatum &get_word() const { return word_; }
+  OB_INLINE const ObObjMeta &get_meta() const { return meta_; }
   OB_INLINE ObCollationType get_collation_type() const { return meta_.get_collation_type(); }
   OB_INLINE bool empty() const { return word_.get_string().empty(); }
   int hash(uint64_t &hash_val) const;
