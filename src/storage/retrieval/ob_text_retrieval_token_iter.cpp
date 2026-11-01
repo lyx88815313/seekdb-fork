@@ -614,30 +614,6 @@ int ObTextRetrievalDaaTTokenIter::compare_doc_id(const ObDatum &left, const ObDa
   return ret;
 }
 
-int ObTextRetrievalDaaTTokenIter::get_curr_score(double &score) const
-{
-  int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(cur_idx_ >= count_)) {
-    ret = OB_ARRAY_OUT_OF_RANGE;
-  } else {
-    // Without a BM25 score the relevance is the positive constant that
-    // save_docids() stored.
-    score = relevance_.get_data()[cur_idx_];
-  }
-  return ret;
-}
-
-int ObTextRetrievalDaaTTokenIter::get_curr_id(const ObDatum *&id_datum) const
-{
-  int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(cur_idx_ >= count_)) {
-    ret = OB_ARRAY_OUT_OF_RANGE;
-  } else {
-    id_datum = &doc_id_.get_data()[cur_idx_].get_datum();
-  }
-  return ret;
-}
-
 ObTextRetrievalBlockMaxIter::ObTextRetrievalBlockMaxIter()
   : ObISRDimBlockMaxIter(),
     token_iter_(),
