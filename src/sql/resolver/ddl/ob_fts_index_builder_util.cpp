@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX STORAGE_FTS
 #include "ob_fts_index_builder_util.h"
 #include "ob_index_builder_util.h"
+#include "lib/cpu/ob_cpu_topology.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
@@ -1040,14 +1041,17 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
   if (OB_UNLIKELY(original_parallelism <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
+    const int64_t cpu_parallelism = MIN(MAX(common::get_cpu_num(), 1L), 4L);
     switch (index_type) {
       case share::schema::ObIndexType::INDEX_TYPE_ROWKEY_DOC_ID_LOCAL:
-        decided_parallelism = MAX(original_parallelism, 1L);
+        decided_parallelism = original_parallelism > 1 ? original_parallelism : cpu_parallelism;
         break;
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        decided_parallelism = MAX(original_parallelism / 3, 1L);
+        decided_parallelism = original_parallelism > 1
+            ? MAX(original_parallelism / 3, 1L)
+            : cpu_parallelism;
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
