@@ -39,7 +39,7 @@ struct ObSRDaaTRelevanceCollector
   virtual int get_result(double &relevance, bool &is_valid) = 0;
 };
 
-struct ObSRDaaTInnerProductRelevanceCollector : ObSRDaaTRelevanceCollector
+struct ObSRDaaTInnerProductRelevanceCollector final : ObSRDaaTRelevanceCollector
 {
   ObSRDaaTInnerProductRelevanceCollector() : ObSRDaaTRelevanceCollector(),
       total_relevance_(0),

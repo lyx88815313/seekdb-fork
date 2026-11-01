@@ -115,6 +115,7 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     merge_heap_(nullptr),
     simple_merge_heap_(nullptr),
     relevance_collector_(nullptr),
+    inner_product_collector_(nullptr),
     iter_domain_ids_(),
     buffered_domain_ids_(),
     buffered_relevances_(),
@@ -189,6 +190,7 @@ void ObSRDaaTIterImpl::reset()
   if (OB_NOT_NULL(relevance_collector_)) {
     relevance_collector_->reset();
     relevance_collector_ = nullptr;
+    inner_product_collector_ = nullptr;
   }
   iter_domain_ids_.reset();
   buffered_domain_ids_.reset();
@@ -363,7 +365,7 @@ int ObSRDaaTIterImpl::collect_dims_by_id(const ObDatum *&id_datum, double &relev
       curr_doc_end = true;
     }
     if (OB_FAIL(merge_heap_top(top_item))) {
-    } else if (OB_FAIL(relevance_collector_->collect_one_dim(top_item->iter_idx_, top_item->relevance_))) {
+    } else if (OB_FAIL(collect_relevance(top_item->iter_idx_, top_item->relevance_))) {
     } else if (FALSE_IT(iter_idx = top_item->iter_idx_)) {
     } else if (OB_FAIL(merge_heap_pop())) {
     } else {
@@ -375,7 +377,7 @@ int ObSRDaaTIterImpl::collect_dims_by_id(const ObDatum *&id_datum, double &relev
     id_datum = iter_domain_ids_.get_data()[iter_idx];
     if (OB_ISNULL(id_datum)) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(relevance_collector_->get_result(relevance, got_valid_id))) {
+    } else if (OB_FAIL(get_relevance_result(relevance, got_valid_id))) {
     } else if (got_valid_id && OB_FAIL(process_collected_row(*id_datum, relevance))) {
     }
   }

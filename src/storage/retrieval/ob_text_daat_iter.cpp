@@ -35,6 +35,8 @@ int ObTextDaaTIter::init(const ObTextDaaTParam &param)
   } else {
     mode_flag_ = param.mode_flag_;
     function_lookup_mode_ = param.function_lookup_mode_;
+    inner_product_collector_ =
+        dynamic_cast<ObSRDaaTInnerProductRelevanceCollector *>(param.relevance_collector_);
   }
   return ret;
 }

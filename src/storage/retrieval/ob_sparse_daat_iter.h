@@ -122,6 +122,18 @@ protected:
   {
     return OB_LIKELY(nullptr != simple_merge_heap_) ? simple_merge_heap_->rebuild() : merge_heap_->rebuild();
   }
+  int collect_relevance(const int64_t dim_idx, const double relevance)
+  {
+    return OB_LIKELY(nullptr != inner_product_collector_)
+        ? inner_product_collector_->collect_one_dim(dim_idx, relevance)
+        : relevance_collector_->collect_one_dim(dim_idx, relevance);
+  }
+  int get_relevance_result(double &relevance, bool &is_valid)
+  {
+    return OB_LIKELY(nullptr != inner_product_collector_)
+        ? inner_product_collector_->get_result(relevance, is_valid)
+        : relevance_collector_->get_result(relevance, is_valid);
+  }
 protected:
   ObIAllocator *iter_allocator_;
   ObSparseRetrievalMergeParam *iter_param_;
@@ -130,6 +142,7 @@ protected:
   ObSRMergeHeap *merge_heap_;
   ObSRSimpleMerger *simple_merge_heap_;
   ObSRDaaTRelevanceCollector *relevance_collector_;
+  ObSRDaaTInnerProductRelevanceCollector *inner_product_collector_;
   ObFixedArray<const ObDatum *, ObIAllocator> iter_domain_ids_; // record every dim iter's output domain id, one (ObDatum *) for one dim iter
   ObFixedArray<ObDocIdExt, ObIAllocator> buffered_domain_ids_; // cache for output
   ObFixedArray<double, ObIAllocator> buffered_relevances_;
