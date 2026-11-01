@@ -102,7 +102,8 @@ int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
                                                                    doc_id_datum,
                                                                    fulltext,
                                                                    is_fts_index_aux_,
-                                                                   rows_))) {
+                                                                   rows_,
+                                                                   &reuse_ctx_))) {
   } else {
     row_idx_ = 0;
   }
@@ -131,6 +132,7 @@ void ObFTIndexRowCache::reset()
   row_idx_ = 0;
   is_fts_index_aux_ = true;
   helper_.reset();
+  reuse_ctx_.reset();
   if (OB_NOT_NULL(merge_memctx_)) {
     DESTROY_CONTEXT(merge_memctx_);
     merge_memctx_ = nullptr;
@@ -285,6 +287,31 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
   return ret;
 }
 
+namespace
+{
+int ensure_ft_word_row_pool(ObFTWordRowsReuseCtx &ctx, const int64_t need_rows, const int64_t col_cnt)
+{
+  int ret = OB_SUCCESS;
+  if (need_rows > ctx.row_pool_cnt) {
+    void *pool_buf = ctx.row_alloc.alloc(need_rows * sizeof(blocksstable::ObDatumRow));
+    if (OB_ISNULL(pool_buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      blocksstable::ObDatumRow *new_pool = new (pool_buf) blocksstable::ObDatumRow[need_rows];
+      for (int64_t i = 0; OB_SUCC(ret) && i < need_rows; ++i) {
+        if (OB_FAIL(new_pool[i].init(ctx.row_alloc, col_cnt))) {
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ctx.row_pool = new_pool;
+        ctx.row_pool_cnt = need_rows;
+      }
+    }
+  }
+  return ret;
+}
+} // unnamed namespace
+
 /*static*/ int ObDASDomainUtils::generate_fulltext_word_rows(common::ObIAllocator &allocator,
                                                              storage::ObFTWordMap &ft_word_map,
                                                              storage::ObFTParseHelper *helper,
@@ -292,7 +319,8 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
                                                              const ObDatum &doc_id_datum,
                                                              const ObString &fulltext,
                                                              const bool is_fts_index_aux,
-                                                             ObDomainIndexRow &word_rows)
+                                                             ObDomainIndexRow &word_rows,
+                                                             ObFTWordRowsReuseCtx *reuse_ctx)
 {
   int ret = OB_SUCCESS;
   static int64_t FT_WORD_DOC_COL_CNT = 4;
@@ -315,16 +343,23 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
                                                  ft_word_map))) {
   } else if (0 == ft_word_map.size()) {
     ret = OB_ITER_END;
+  } else if (nullptr != reuse_ctx) {
+    if (OB_FAIL(ensure_ft_word_row_pool(*reuse_ctx, ft_word_map.size(), FT_WORD_DOC_COL_CNT))) {
+    } else {
+      rows = reuse_ctx->row_pool;
+    }
   } else if (OB_ISNULL(rows_buf = reinterpret_cast<char *>(
                            allocator.alloc(ft_word_map.size() * sizeof(blocksstable::ObDatumRow))))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
-    int64_t i = 0;
     rows = new (rows_buf) blocksstable::ObDatumRow[ft_word_map.size()];
+  }
+  if (OB_SUCC(ret)) {
+    int64_t i = 0;
     for (ObFTWordMap::const_iterator iter = ft_word_map.begin();
          OB_SUCC(ret) && iter != ft_word_map.end();
          ++iter) {
-      if (OB_FAIL(rows[i].init(allocator, FT_WORD_DOC_COL_CNT))) {
+      if (!rows[i].is_valid() && OB_FAIL(rows[i].init(allocator, FT_WORD_DOC_COL_CNT))) {
       } else {
         const ObFTWord &ft_word = iter->first;
         const int64_t word_cnt = iter->second;

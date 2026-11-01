@@ -32,6 +32,25 @@ namespace sql
 {
 
 
+struct ObFTWordRowsReuseCtx
+{
+  common::ObArenaAllocator row_alloc;
+  blocksstable::ObDatumRow *row_pool;
+  int64_t row_pool_cnt;
+  ObFTWordRowsReuseCtx()
+    : row_alloc("FTWordRowPool", OB_MALLOC_NORMAL_BLOCK_SIZE),
+      row_pool(nullptr),
+      row_pool_cnt(0)
+  {
+  }
+  void reset()
+  {
+    row_pool = nullptr;
+    row_pool_cnt = 0;
+    row_alloc.reset();
+  }
+};
+
 class ObFTIndexRowCache final
 {
 public:
@@ -61,6 +80,7 @@ private:
   // The word map is reused across the documents of an index build: creating a
   // hash map for every document is a significant part of the build cost.
   storage::ObFTWordMap word_map_;
+  ObFTWordRowsReuseCtx reuse_ctx_;
   bool is_inited_;
 
   DISALLOW_COPY_AND_ASSIGN(ObFTIndexRowCache);
@@ -190,7 +210,8 @@ public:
                                          const ObDatum &doc_id_datum,
                                          const ObString &fulltext,
                                          const bool is_fts_index_aux,
-                                         ObDomainIndexRow &word_rows);
+                                         ObDomainIndexRow &word_rows,
+                                         ObFTWordRowsReuseCtx *reuse_ctx = nullptr);
   static int generate_multivalue_index_rows(
       ObIAllocator &allocator,
       const ObDASDMLBaseCtDef &das_ctdef,
