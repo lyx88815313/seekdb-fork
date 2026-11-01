@@ -27,6 +27,25 @@ namespace blocksstable
 using namespace common;
 const ObColumnHeader::Type ObStringDiffDecoder::type_;
 
+static inline void copy_string_diff_row(const ObStringDiffHeader &header,
+    const char *cell_data, char *str_ptr)
+{
+  int64_t common_pos = 0;
+  int64_t cell_pos = 0;
+  int64_t str_pos = 0;
+  for (int64_t i = 0; i < header.diff_desc_cnt_; ++i) {
+    const int64_t count = header.diff_descs_[i].count_;
+    if (header.diff_descs_[i].diff_) {
+      MEMCPY(str_ptr + str_pos, cell_data + cell_pos, count);
+      cell_pos += count;
+    } else {
+      MEMCPY(str_ptr + str_pos, header.common_data() + common_pos, count);
+      common_pos += count;
+    }
+    str_pos += count;
+  }
+}
+
 ObStringDiffDecoder::ObStringDiffDecoder() : header_(NULL)
 {
 }
@@ -165,7 +184,7 @@ int ObStringDiffDecoder::batch_decode(
     if (OB_FAIL(ret)) {
     } else if (OB_ISNULL(buf = static_cast<char *>(ctx.allocator_->alloc(buf_size * row_cap)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
-    } else {
+    } else if (header_->is_hex_packing()) {
       for (int64_t i = 0; i < row_cap; ++i) {
         header_->copy_string(ObStringDiffHeader::LeftToRight(), std::logical_not<uint8_t>(),
             header_->common_data(), buf + i * buf_size);
@@ -191,10 +210,7 @@ int ObStringDiffDecoder::batch_decode(
                 static_cast<void (ObHexStringUnpacker::*)(unsigned char &)>(&ObHexStringUnpacker::unpack),
                 reinterpret_cast<unsigned char *>(str_ptr));
           } else {
-            header_->copy_string(
-              ObStringDiffHeader::LeftToRight(),
-              ObStringDiffHeader::LogicTrue<uint8_t>(),
-              cell_data, str_ptr);
+            copy_string_diff_row(*header_, reinterpret_cast<const char *>(cell_data), str_ptr);
           }
           datums[i].pack_ = string_size;
           datums[i].ptr_ = str_ptr;
@@ -223,10 +239,7 @@ int ObStringDiffDecoder::batch_decode(
                 static_cast<void (ObHexStringUnpacker::*)(unsigned char &)>(&ObHexStringUnpacker::unpack),
                 reinterpret_cast<unsigned char *>(str_ptr));
           } else {
-            header_->copy_string(
-              ObStringDiffHeader::LeftToRight(),
-              ObStringDiffHeader::LogicTrue<uint8_t>(),
-              cell_data, str_ptr);
+            copy_string_diff_row(*header_, reinterpret_cast<const char *>(cell_data), str_ptr);
           }
           datums[i].pack_ = string_size;
           datums[i].ptr_ = str_ptr;
