@@ -28,6 +28,10 @@
 #include "lib/utility/ob_macro_utils.h"
 #include "lib/charset/ob_ctype_utf8_tab.h"
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 #define IS_CONTINUATION_BYTE(code) (((code) >> 6) == 0x02)
 
 static int ob_valid_mbcharlen_utf8mb3(const uchar *s, const uchar *e)
@@ -376,6 +380,32 @@ ob_utf8mb4_general_ci_fast_prefix(const unsigned char *&s, const unsigned char *
                                   const unsigned char *&t, const unsigned char *te,
                                   int &cmp_ret)
 {
+#if defined(__SSE2__)
+  const __m128i lower_a = _mm_set1_epi8('a' - 1);
+  const __m128i lower_z = _mm_set1_epi8('z' + 1);
+  const __m128i case_bit = _mm_set1_epi8(0x20);
+  while (se - s >= 16 && te - t >= 16) {
+    const __m128i sv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s));
+    const __m128i tv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(t));
+    if (0 != _mm_movemask_epi8(_mm_or_si128(sv, tv))) {
+      break;
+    }
+    const __m128i s_lower = _mm_and_si128(_mm_cmpgt_epi8(sv, lower_a), _mm_cmpgt_epi8(lower_z, sv));
+    const __m128i t_lower = _mm_and_si128(_mm_cmpgt_epi8(tv, lower_a), _mm_cmpgt_epi8(lower_z, tv));
+    const __m128i su = _mm_andnot_si128(_mm_and_si128(s_lower, case_bit), sv);
+    const __m128i tu = _mm_andnot_si128(_mm_and_si128(t_lower, case_bit), tv);
+    const uint32_t equal_mask = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(su, tu)));
+    if (0xFFFFU == equal_mask) {
+      s += 16;
+      t += 16;
+    } else {
+      const int offset = __builtin_ctz(equal_mask ^ 0xFFFFU);
+      s += offset;
+      t += offset;
+      break;
+    }
+  }
+#endif
   uint32_t sw = 0;
   uint32_t tw = 0;
   while (s < se && t < te) {
