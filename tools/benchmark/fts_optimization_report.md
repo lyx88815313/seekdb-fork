@@ -3194,3 +3194,85 @@ TEXT RETRIEVAL SCAN，本机 20 行只要 ~0.5 ms。但带 `id` 列时要回表
    疑似上一个构建的 sort 临时文件/后台合并还没落稳。如果能让每个
    ALTER 的 DDL 收尾（flush + 等待合并）变短，三个构建就都能落在
    "好签"上，这一项就值 2~4 分。
+
+## 15. 第 12 轮：构建链路 DDL 固定开销剖析（结论：机制已紧凑，无可安全削减项）
+
+第 11 轮 CI 之后，构建类是唯一没有动过的类别（`build_ik_all` 三轮钉在 6.15~6.26s，
+`build_ik_content`/`build_beng_en` 在 2.6~6.6s 之间抽签）。这一轮对一次真实的
+`ALTER TABLE docs ADD FULLTEXT INDEX fti_content_ik(content) WITH PARSER ik`
+（本机 45.2s）做了三方交叉剖析：`__all_ddl_task_status` 状态机停留时间
+（RS 的 `switch_status` 日志逐条重放）、observer 日志窗口（14,438 行，按线程归因）、
+以及 499Hz 全进程 perf（addr2line 精确归因）。
+
+### 15.1 时间分解（本机 45.2s，warm）
+
+| 阶段 | 耗时 | 性质 |
+| --- | --- | --- |
+| 生成 rowkey_doc 辅表（schema+tablet+publish） | 1.5s | 固定编排 |
+| 等 rowkey_doc 补数 | 1.3s | 固定编排 |
+| LOAD_DICTIONARY 状态（词典检查 0.75s + 生成 3 张辅表 schema/publish 3.85s） | 4.6s | 固定编排 |
+| 子任务 WAIT_TRANS_END（快照/事务收尾，与数据构建部分重叠） | ~6.4s | 固定编排 |
+| 子任务数据构建（PX 扫描→分词→排序落盘→回填→DDL KV merge） | ~17.0s | 数据量+盘速 |
+| 子任务 VALIDATE_CHECKSUM ×2 | ~2.8s | 固定编排 |
+| 子任务 TAKE_EFFECT→SUCCESS ×3 | ~6.8s | 固定编排 |
+
+CPU 侧：45s 墙钟内只有约 16 CPU 秒（perf 7,874 个样本），热点全在通用件
+（`ObDatumDesc::is_null` 合计 ~4.9%、kv 页校验 crc32 ~1.9%、后台调度循环），
+**没有任何 >3% 的 fulltext 专属热点**——构建是"等待/编排"型，不是 CPU 型。
+这也解释了第 8~11 轮的 CPU 优化（字符集快路径、crc32 指令、词典去 libc）
+对构建类几乎零增益：省下的都不是关键路径。
+
+### 15.2 结构发现（每条都查了代码）
+
+1. **一个 FTS ALTER = 最多 4 个子 `ObIndexBuildTask`**（rowkey_doc、doc_rowkey、
+   domain aux、doc_word），每个都跑完整通用状态机（PREPARE→WAIT_TRANS_END→
+   REDEFINITION→VALIDATE_CHECKSUM→TAKE_EFFECT→SUCCESS）。**同表的第二个
+   FTS 索引开始，rowkey_doc/doc_rowkey 两张共享表不再重建**（上游已做：
+   "fts index aux table already exist, no need to generate"），所以
+   `ik_content`/`beng_en` 只有 2 个子任务。这与 CI 读数一致：
+   `beng_en`(2 子任务) 2.62s ≈ 编排 1.5~2s + 数据 <1s；
+   `ik_all`(4 子任务+最大数据量) 6.25s。
+2. **词典不会每个 ALTER 重载**：`ObDicLoader::check_need_load_dic()` 恒返回
+   false，LOAD_DICTIONARY 状态里真正的开销是其后 3 张辅表的 schema 生成+发布。
+3. **FTS 索引表与 doc_word 辅表已跳过 checksum 校验**（上游
+   `need_verify_checksum = false`），rowkey_doc/doc_rowkey 仍各有一次
+   VALIDATE_CHECKSUM 停留（且只存在于第一个 FTS 构建）。
+4. **调度节奏已经是即时的**：真正在跑的调度器是 `ObDDLScheduler::do_work`，
+   状态切换后 `delay_schedule_time_=0` + `idler_.wakeup()` 立即续跑，同状态
+   轮询间隔 10ms；`ob_ddl_task_executor.h` 里那个 100ms `CHECK_TASK_INTERVAL`
+   的 `ObDDLTaskExecutor` 类没有任何实例化（死代码）。"缩短轮询间隔"
+   这条最诱人的思路被证据否定。
+5. 每个状态推进的真实开销是**schema 发布+全量增量刷新**：每次发布触发
+   `fetch_increment_schemas`，把 users/databases/tables/outlines/routines/
+   packages/triggers/privs 全部对象类型的增量各查一遍（本机一次 ~0.5~1s，
+   CI 上估计 ~0.1~0.3s），一次构建约 5 次。这是 schema 服务的共享设计，
+   不是 FTS 能安全改的地方。
+
+### 15.3 被排除的优化方向与理由
+
+| 方向 | 预期收益 | 排除理由 |
+| --- | --- | --- |
+| 4 个子任务共享一次快照（消掉 3 次 WAIT_TRANS_END） | 每 ALTER ~1-2s | 子任务各自的 schema_version 更晚，共享早快照在"事务跨 schema 发布仍晚提交"的并发写场景下可能漏行；等价性论证不成立，风险不可接受 |
+| 3 个 doc 辅表子任务并行构建 | 数据路径减半 | doc_rowkey/domain/doc_word 的构建 SQL 依赖 rowkey_doc 的数据（父任务 `WAIT_ROWKEY_DOC_TABLE_COMPLEMENT` 先行），串行是语义要求 |
+| 跳过 rowkey_doc/doc_rowkey 的 VALIDATE_CHECKSUM | 仅 ik_all ~1.4s | 属于削减一致性校验，且不影响 ik_content/beng_en，性价比和观感都差 |
+| 提高构建排序的内存配额避免落盘 | 本机显著 | 排序拿到的是内存管理器的"单遍排序"配额（`expect_size = sqrt(缓存×chunk)`，本机 2MB），这是刻意设计；CI 租户内存下很可能本就不落盘，本机现象不可迁移 |
+| 缩短 DDL 轮询/发布重试间隔 | ~0 | 见 15.2 第 4、5 条，节奏已是即时，重试路径不在关键路径上 |
+
+### 15.4 坏签（±2s 抽签）的定位
+
+官方基准的三次 ALTER 背靠背执行（`fts_large_bench.sh` 第 296-301 行），第 2/3
+个构建会撞上第 1/2 个构建刚产生的后台工作：新辅表 tablet 的合并调度
+（`handle_index_table` 每轮扫全部索引表）、前一次 DROP 的 tablet GC、
+以及 5 次 schema 刷新的余波。三次 CI 里坏签分别落在第 3（r10 `beng_en` 5.627s）、
+第 2（r11 `ik_content` 6.634s）个构建上，同一量级、换位出现，符合"串扰"
+而非"系统性变慢"。本机连续两次构建 44.1s→45.2s 看不出惩罚（本机噪声更大）。
+**消除它需要在 DDL 进行中压制后台合并优先级，属于共享调度器改动，
+风险大于 2~4 分的期望收益，本轮不做。**
+
+### 15.5 结论
+
+构建链路的 DDL 固定开销（~1.5-2s/ALTER）已经紧凑：子表跨索引共享、词典不重载、
+FTS 校验跳过、调度即时。剩余成本 = 数据路径 CPU（分词，第 5~10 轮已压）+
+存储 DDL KV merge（共享数据面）+ ~5 次 schema 发布的固有代价。
+**本轮不提交构建类代码改动**——所有候选要么等价性不成立，要么收益不可迁移，
+要么风险大于收益；与其带一个验证不了的风险改动上 CI，不如保持 r11 代码再抽一次签。
