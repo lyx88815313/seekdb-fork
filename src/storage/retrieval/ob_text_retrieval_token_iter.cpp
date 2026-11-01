@@ -83,9 +83,7 @@ int ObTextRetrievalTokenIter::init(const ObTextRetrievalScanIterParam &iter_para
   } else if (OB_FAIL(init_calc_exprs_in_relevance_expr())) {
   } else {
   }
-  if (OB_SUCC(ret)) {
-    // The skip vector is needed even when the relevance score is not
-    // calculated, because the document ids are collected with it.
+  if (OB_SUCC(ret) && need_calc_relevance()) {
     if (OB_ISNULL(skip_ = sql::to_bit_vector(
                          allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size_))))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -546,13 +544,11 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
     cur_idx_ = 0;
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
-      if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        // Without a BM25 score the relevance is a positive constant: the
-        // consumers only ask whether the document matched at all.
-        relevance_.get_data()[i] = 1.0;
-        if (OB_FAIL(doc_id_.get_data()[i].from_datum(*doc_id_datum.at(i)))) {
-        };
-      }
+      // Without a BM25 score the relevance is a positive constant: the
+      // consumers only ask whether the document matched at all.
+      relevance_.get_data()[i] = 1.0;
+      if (OB_FAIL(doc_id_.get_data()[i].from_datum(*doc_id_datum.at(i)))) {
+      };
     }
   }
   return ret;
