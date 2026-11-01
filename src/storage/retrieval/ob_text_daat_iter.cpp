@@ -78,6 +78,45 @@ int ObTextDaaTIter::pre_process()
   return ret;
 }
 
+int ObTextDaaTIter::fill_merge_heap()
+{
+  int ret = OB_SUCCESS;
+  ObSRMergeItem item;
+  for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
+    const int64_t iter_idx = next_round_iter_idxes_.get_data()[i];
+    ObTextRetrievalDaaTTokenIter *dim_iter =
+        static_cast<ObTextRetrievalDaaTTokenIter *>(dim_iters_->get_data()[iter_idx]);
+    if (OB_ISNULL(dim_iter)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(dim_iter->get_next_row())) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("fail to try load next batch dimension data", K(ret));
+      } else {
+        ret = OB_SUCCESS;
+      }
+    } else if (OB_FAIL(dim_iter->get_curr_score(item.relevance_))) {
+    } else if (OB_NOT_NULL(iter_param_->dim_weights_)
+               && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_
+                           * iter_param_->dim_weights_->get_data()[iter_idx])) {
+    } else if (OB_FAIL(dim_iter->get_curr_id(iter_domain_ids_.get_data()[iter_idx]))) {
+    } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
+    } else if (OB_FAIL(merge_heap_push(item))) {
+    } else {
+      LOG_DEBUG("push item to merge heap", K(ret), K(i), K(iter_idx), K(next_round_cnt_), K(item),
+                K(iter_domain_ids_[iter_idx]));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (merge_heap_empty()) {
+    ret = OB_ITER_END;
+  } else if (0 != next_round_cnt_ && OB_FAIL(merge_heap_rebuild())) {
+  } else {
+    next_round_cnt_ = 0;
+  }
+  return ret;
+}
+
 ObTextBMWIter::ObTextBMWIter()
   : ObSRBMWIterImpl(),
     bm25_param_estimator_() {}

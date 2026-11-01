@@ -63,6 +63,7 @@ public:
   virtual void reset() override;
 protected:
   virtual int pre_process() override;
+  virtual int fill_merge_heap() override;
 protected:
   ObBM25ParamEstimator bm25_param_estimator_;
   sql::ObMatchAgainstMode mode_flag_;
