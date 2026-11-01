@@ -221,6 +221,108 @@ int prepare_token_map(ObFTTokenMapCache &cache, const int64_t bkt_cnt, const boo
   }
   return ret;
 }
+
+constexpr int MAX_TOKENIZE_RESULT_CACHE_CNT = 2;
+constexpr int64_t MAX_TOKENIZE_RESULT_TEXT_LEN = 2048;
+constexpr int64_t MAX_TOKENIZE_RESULT_PROPS_LEN = 2048;
+constexpr int64_t MAX_TOKENIZE_RESULT_BIN_LEN = 32768;
+
+struct ObFTTokenizeResultCacheEntry
+{
+  ObFTTokenizeResultCacheEntry()
+      : parser_name_len_(0), properties_len_(0), fulltext_len_(0), result_len_(0),
+        collation_type_(common::CS_TYPE_INVALID), output_mode_(-1), is_used_(false)
+  {
+  }
+  char parser_name_[storage::OB_FT_PARSER_NAME_LENGTH];
+  int64_t parser_name_len_;
+  char properties_[MAX_TOKENIZE_RESULT_PROPS_LEN];
+  int64_t properties_len_;
+  char fulltext_[MAX_TOKENIZE_RESULT_TEXT_LEN];
+  int64_t fulltext_len_;
+  char result_[MAX_TOKENIZE_RESULT_BIN_LEN];
+  int64_t result_len_;
+  common::ObCollationType collation_type_;
+  int output_mode_;
+  bool is_used_;
+};
+
+struct ObFTTokenizeResultCache
+{
+  ObFTTokenizeResultCache() : next_slot_(0) {}
+  ObFTTokenizeResultCacheEntry entries_[MAX_TOKENIZE_RESULT_CACHE_CNT];
+  int next_slot_;
+};
+
+ObFTTokenizeResultCache &get_tokenize_result_cache()
+{
+  static thread_local ObFTTokenizeResultCache *cache = new ObFTTokenizeResultCache();
+  return *cache;
+}
+
+bool is_tokenize_result_cacheable(const ObExprTokenize::TokenizeParam &param)
+{
+  return param.parser_name_.length() >= 0
+      && param.parser_name_.length() <= storage::OB_FT_PARSER_NAME_LENGTH
+      && param.properties_.length() >= 0
+      && param.properties_.length() <= MAX_TOKENIZE_RESULT_PROPS_LEN
+      && param.fulltext_.length() >= 0
+      && param.fulltext_.length() <= MAX_TOKENIZE_RESULT_TEXT_LEN;
+}
+
+ObFTTokenizeResultCacheEntry *find_tokenize_result(
+    ObFTTokenizeResultCache &cache, const ObExprTokenize::TokenizeParam &param)
+{
+  ObFTTokenizeResultCacheEntry *result = nullptr;
+  for (int i = 0; i < MAX_TOKENIZE_RESULT_CACHE_CNT; ++i) {
+    ObFTTokenizeResultCacheEntry &entry = cache.entries_[i];
+    if (entry.is_used_
+        && entry.parser_name_len_ == param.parser_name_.length()
+        && entry.properties_len_ == param.properties_.length()
+        && entry.fulltext_len_ == param.fulltext_.length()
+        && entry.collation_type_ == param.meta_.get_collation_type()
+        && entry.output_mode_ == static_cast<int>(param.output_mode_)
+        && (param.parser_name_.empty()
+            || 0 == memcmp(entry.parser_name_, param.parser_name_.ptr(), param.parser_name_.length()))
+        && (param.properties_.empty()
+            || 0 == memcmp(entry.properties_, param.properties_.ptr(), param.properties_.length()))
+        && (param.fulltext_.empty()
+            || 0 == memcmp(entry.fulltext_, param.fulltext_.ptr(), param.fulltext_.length()))) {
+      result = &entry;
+      break;
+    }
+  }
+  return result;
+}
+
+void store_tokenize_result(ObFTTokenizeResultCache &cache,
+                           const ObExprTokenize::TokenizeParam &param,
+                           const ObString &result)
+{
+  if (result.length() >= 0 && result.length() <= MAX_TOKENIZE_RESULT_BIN_LEN) {
+    ObFTTokenizeResultCacheEntry &entry = cache.entries_[cache.next_slot_];
+    cache.next_slot_ = (cache.next_slot_ + 1) % MAX_TOKENIZE_RESULT_CACHE_CNT;
+    if (!param.parser_name_.empty()) {
+      MEMCPY(entry.parser_name_, param.parser_name_.ptr(), param.parser_name_.length());
+    }
+    if (!param.properties_.empty()) {
+      MEMCPY(entry.properties_, param.properties_.ptr(), param.properties_.length());
+    }
+    if (!param.fulltext_.empty()) {
+      MEMCPY(entry.fulltext_, param.fulltext_.ptr(), param.fulltext_.length());
+    }
+    if (!result.empty()) {
+      MEMCPY(entry.result_, result.ptr(), result.length());
+    }
+    entry.parser_name_len_ = param.parser_name_.length();
+    entry.properties_len_ = param.properties_.length();
+    entry.fulltext_len_ = param.fulltext_.length();
+    entry.result_len_ = result.length();
+    entry.collation_type_ = param.meta_.get_collation_type();
+    entry.output_mode_ = static_cast<int>(param.output_mode_);
+    entry.is_used_ = true;
+  }
+}
 } // anonymous namespace
 
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
@@ -243,12 +345,24 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
 
   ObIJsonBase *json_result = nullptr;
   TokenizeParam param;
+  ObFTTokenizeResultCacheEntry *cache_entry = nullptr;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
+  } else if (is_tokenize_result_cacheable(param)
+             && OB_NOT_NULL(cache_entry = find_tokenize_result(get_tokenize_result_cache(), param))) {
+    ObString cached_result(cache_entry->result_len_, cache_entry->result_);
+    ret = ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, cached_result);
   } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+  } else if (is_tokenize_result_cacheable(param) && OB_NOT_NULL(json_result)) {
+    ObString result;
+    if (OB_FAIL(share::ObJsonWrapper::get_raw_binary(json_result, result, &temp_allocator))) {
+    } else if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, result))) {
+    } else {
+      store_tokenize_result(get_tokenize_result_cache(), param, result);
+    }
   } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
                                                      ctx,
                                                      temp_allocator,

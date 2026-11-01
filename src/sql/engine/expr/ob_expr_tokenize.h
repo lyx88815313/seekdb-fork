@@ -48,7 +48,7 @@ public:
                         common::ObExprTypeCtx &type_ctx) const override;
   int cg_expr(ObExprCGCtx &op_cg_ctx, const ObRawExpr &raw_expr, ObExpr &rt_expr) const override;
 
-private:
+public:
   struct TokenizeParam
   {
   public:
