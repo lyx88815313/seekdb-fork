@@ -25,20 +25,6 @@ namespace oceanbase
 namespace storage
 {
 
-// Binary collation comparison of two string datums.
-//
-// It reproduces ob_strnncoll_binary()/ob_strnncoll_mb_bin() exactly: the
-// bytes are compared first and the length difference breaks the tie when one
-// string is a prefix of the other. Both are used by the generic datum
-// comparison, but they go through the charset dispatch, which is a measurable
-// cost when the merge heap compares the doc ids of every output row.
-inline int64_t bin_string_cmp(const ObDatum &left, const ObDatum &right)
-{
-  const int64_t min_len = MIN(left.len_, right.len_);
-  const int mem_cmp = (min_len > 0) ? memcmp(left.ptr_, right.ptr_, static_cast<size_t>(min_len)) : 0;
-  return (0 == mem_cmp) ? (static_cast<int64_t>(left.len_) - static_cast<int64_t>(right.len_)) : mem_cmp;
-}
-
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
     iter_ids_(nullptr),
@@ -79,28 +65,6 @@ int ObSRMergeCmp::init(
       // memcmp plus the length difference.
       fast_bin_string_ = is_string_type;
       is_inited_ = true;
-    }
-  }
-  return ret;
-}
-
-int ObSRMergeCmp::cmp(
-    const ObSRMergeItem &l,
-    const ObSRMergeItem &r,
-    int64_t &cmp_ret)
-{
-  int ret = OB_SUCCESS;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-  } else {
-    int tmp_ret = 0;
-    const ObDatum &l_id = get_id_datum(l.iter_idx_);
-    const ObDatum &r_id = get_id_datum(r.iter_idx_);
-    if (OB_LIKELY(fast_bin_string_) && OB_LIKELY(!l_id.is_null() && !r_id.is_null())) {
-      cmp_ret = bin_string_cmp(l_id, r_id);
-    } else if (OB_FAIL(cmp_func_(l_id, r_id, tmp_ret, nullptr))) {
-    } else {
-      cmp_ret = tmp_ret;
     }
   }
   return ret;
