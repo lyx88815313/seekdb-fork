@@ -2328,7 +2328,12 @@ int ObTscCgService::extract_text_ir_access_columns(
   } else {
     switch (scan_ctdef.ir_scan_type_) {
     case ObTSCIRScanType::OB_IR_INV_IDX_SCAN:
-      if (tr_info.need_calc_relevance_ || nullptr != tr_info.pushdown_match_filter_) {
+      // The token frequency and the document length only feed the BM25
+      // expression.  When the relevance score is not observed the match
+      // expression is self produced by the retrieval iterator, so the pushed
+      // down match filter never reads those columns and they can be pruned
+      // from the inverted index scan.
+      if (tr_info.need_calc_relevance_) {
         if (OB_FAIL(add_var_to_array_no_dup(access_exprs, static_cast<ObRawExpr*>(tr_info.token_cnt_column_)))) {
         } else if (OB_FAIL(add_var_to_array_no_dup(access_exprs, static_cast<ObRawExpr*>(tr_info.docid_or_rowkey_column_)))) {
         } else if (OB_FAIL(add_var_to_array_no_dup(access_exprs, static_cast<ObRawExpr*>(tr_info.doc_length_column_)))) {
@@ -2690,7 +2695,9 @@ int ObTscCgService::extract_text_ir_das_output_column_ids(
 {
   int ret = OB_SUCCESS;
   if (ObTSCIRScanType::OB_IR_INV_IDX_SCAN == scan_ctdef.ir_scan_type_) {
-    if (tr_info.need_calc_relevance_ || nullptr != tr_info.pushdown_match_filter_) {
+    // Keep the posting columns only when the BM25 score has to be calculated;
+    // a self produced match expression does not need them.
+    if (tr_info.need_calc_relevance_) {
       if (OB_FAIL(output_cids.push_back(
           static_cast<ObColumnRefRawExpr *>(tr_info.token_cnt_column_)->get_column_id()))) {
       } else if (OB_FAIL(output_cids.push_back(
@@ -3026,7 +3033,8 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
         doc_length_col_idx = i;
       }
     }
-    const bool need_doc_length = tr_info.need_calc_relevance_ || nullptr != tr_info.pushdown_match_filter_;
+    // The document length is only an input of the BM25 expression.
+    const bool need_doc_length = tr_info.need_calc_relevance_;
     if (OB_UNLIKELY(-1 == doc_id_col_idx || (need_doc_length && -1 == doc_length_col_idx))) {
       ret = OB_ERR_UNEXPECTED;
     } else {
