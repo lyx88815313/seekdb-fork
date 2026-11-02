@@ -3413,3 +3413,142 @@ doc id，计时绝对值小），单轮顺序跑不可信，必须 ABBA。
 是第 16 轮之后查询侧最干净的一次收益。下一步候选：倒排扫描侧仍可能存在
 的逐 doc id 接口往返（有序 posting 流的批量消费），以及构建侧 DDL 排序的
 紧凑记录格式（数据量大，风险高，留作后手）。
+
+---
+
+## 18. 第 18 轮：跟进 master 的防御检查默认值（r20，commit 待定）
+
+### 18.1 一次反常的分数下跌
+
+`0de5a71dc`（第 16 轮收尾）的官方读数是 **38.337 分**，而更早的 `7b9a76348`
+是 **46.535 分**。但把两份 metrics 并排看，`0de5a71dc` **几乎所有指标都更快**：
+
+| 指标 | 7b9a76348 | 0de5a71dc | 变化 |
+| --- | --- | --- | --- |
+| `build_total_sec` | 13.308 | 12.302 | 快 7.6% |
+| `query_cn_avg_ms` | 0.7789 | 0.6579 | 快 15.5% |
+| `query_beng_avg_ms` | 1.1404 | 0.9396 | 快 17.6% |
+| `query_mixed_avg_ms` | 0.8764 | 0.7506 | 快 14.4% |
+| `tokenize_ik_avg_ms` | 0.0374 | 0.0358 | 快 4.3% |
+| `fts_raw_score` | 93.070 | 76.674 | **-16.4** |
+
+**自己的指标全面变快，分数反而跌 8.2 分**——这不可能是我们的代码退化，
+只能是基线动了。
+
+### 18.2 计分公式与基线的真实性质
+
+`tools/benchmark/fts_large_bench_score.py` 给出了完整口径：
+
+- 三个类：`build`（3 项）、`tokenize`（2 项）、`query`（4 项）；
+- **类内先平均，三类再等权平均**；
+- `score = clamp(mean_improvement, 0, 0.5) / 0.5 * 100`，满分 100。
+
+仓库里 checked-in 的 `fts_large_bench_baseline.json`（2026-07-07 五次 VLDB CI
+平均，`build_ik_all_sec` = 35.28 s）**不是 CI 实际使用的基线**：用它算
+`0de5a71dc` 会得到 mean 91.6%、score 183，而官方只给 76.67。
+CI 的基线是**每次重新在 master 上实测**的，会随 master 的演进而移动。
+
+用第 8 轮官方分项提升率（报告 11.5.1）反推 CI 基线后计算 `0de5a71dc`：
+
+| 类别 | 提升率 | 判断 |
+| --- | --- | --- |
+| build（3 项） | **约 22%** | **瓶颈，最低** |
+| tokenize（2 项） | 约 44% | 中等 |
+| query（4 项） | 约 60% | 已很高，难再提 |
+
+**口径澄清**：用户口头说的"分数"是 `fts_mean_improvement × 100`
+（38.337 分 ↔ `fts_raw_score` 76.674）。按 `score.py`，`fts_raw_score` 本身
+就是满分 100 的得分。因此"50 分"对应 `mean_improvement ≥ 50%`，即满分。
+
+### 18.3 基线的移动来源：master 上两个性能提交
+
+我们的 base（`54d25bafe`）与 `origin/master` **已 diverged**，master 上有 23 个
+我们没有的提交。逐一核对后，只有两个与 benchmark 相关：
+
+| commit | 内容 | 相关性 |
+| --- | --- | --- |
+| `2d6a63248` | `perf(config): disable defensive checks by default (#1640)` | **直接相关**，见 18.4 |
+| `d69f2dc3e` | `feat(sql): replace ICU regex with Rust fancy-regex (#1966)` | 只影响 SQL `REGEXP` 函数，与 IK/beng 分词无关 |
+
+其余 21 个都是 build/docs/security/Windows 相关，无一影响 FTS benchmark。
+
+### 18.4 本轮改动：把 `_enable_defensive_check` 默认值改成 0
+
+`2d6a63248` 本身只改一行配置（外加两个 mysqltest 期望文件和一个无关的
+`Cargo.lock` TLS 依赖刷新）。我们只应用核心那一行：
+
+`rust/config/parameters.yaml`
+
+```diff
+ - name: _enable_defensive_check
+   type: INT_WITH_CHECKER
+-  default: "1"
++  default: "0"
+```
+
+commit 自带实测数据：同进程 stock UPDATE，单线程 **+33.0%**、16 线程 **+50.1%**。
+
+### 18.5 开销机制（为什么它落在 build 类上）
+
+`src/storage/ob_dml_running_ctx.cpp:183`：
+
+```cpp
+} else if ((config::_enable_defensive_check() > 0)) {
+  is_need_check_old_row_ = true;
+  if ((relative_table_.is_index_table() && !relative_table_.can_read_index())
+      || dml_param_.is_main_table_in_fts_ddl_ ) {
+```
+
+开关打开时**每个 DML 都要额外读旧行做校验**，且同一处的注释直接点名
+`is_main_table_in_fts_ddl_`（FTS DDL 场景）。另有一处
+`src/storage/tx/ob_trans_service.cpp:121`：开关打开时每个事务都要分配一个
+`ObDefensiveCheckMgr`。
+
+查询路径上唯一的开关使用（`src/storage/access/ob_single_merge.cpp:289`）只在
+`is_lookup_for_4377()` 时触发，**常规查询不受影响**；因此本轮预期只动
+build 类，归因干净。
+
+### 18.6 性能（待填）
+
+### 18.7 正确性（待填）
+
+### 18.8 小结（待填）
+
+### 18.6 性能
+
+build 类 A/B（`ALTER TABLE docs_ab ADD FULLTEXT INDEX fti_ab(title, content)
+WITH PARSER ik`，20000 行，ABBA 交错 4 轮，A=10103 r19 / B=10104 r20）：
+
+| 轮次 | A (ms) | B (ms) |
+| --- | --- | --- |
+| 1 | 44734 / 42891 | 32039 / 37541 |
+| 2 | 36050 / 35781 | 30127 / 31693 |
+| 3 | 38147 / 46050 | 50548 / 41321 |
+| 4 | 38798 / 33724 | 32874 / 29589 |
+| **均值** | **39522** | **35716** |
+
+**build 类 -9.63%**。查询与分词路径无系统性差异（qcn +0.5%、qbeng -0.8%、
+qlimit -6.4%，均在噪声带内），与 18.5 的机制分析一致。
+
+### 18.7 正确性
+
+`/tmp/verify_r11.sh 10104(r20) 10103(r19)`：tokenize / hits / rows(800) /
+coll / bigcoll 全部 **IDENTICAL**。
+
+### 18.8 小结
+
+本轮不是"新的优化"，而是**把被 master 基线甩开的部分补回来**：`0de5a71dc`
+指标全面变快却跌 8.2 分，根因是 master 拿到了 `_enable_defensive_check`
+默认关闭而我们没有，build 类的比较因此不对等。补齐后 build 类 -9.6%。
+
+按 18.2 的三类结构估算：build 从约 22% 提升到约 30%，mean 提升约
++2.7 pp（用户口径 +2.7 分）。**剩下的缺口主要在 build 类本身**（仍低于
+tokenize 的 44% 和 query 的 60%），下一轮应继续在 build 链路上找单点热点。
+
+#### 18.8.1 构建环境的两个坑（本轮复现，后续注意）
+
+1. 改 `rust/config/parameters.yaml` 后 `make -n` 一度报告 0 个待编译单元
+   （`libconfig.a` 的 mtime 比 yaml 新），但实际 `make` 会重编 **144 个
+   C++ 单元**——cmake 的 depend 阶段会刷新依赖。不能信 `make -n` 的单元数。
+2. 前台 `make -j1 seekdb` 超过工具 300s 超时会被杀（链接未完成，二进制
+   mtime 不变）。必须 `setsid -f` 脱离会话，日志 `/tmp/r20_link.log`。
