@@ -3276,3 +3276,53 @@ FTS 校验跳过、调度即时。剩余成本 = 数据路径 CPU（分词，第
 存储 DDL KV merge（共享数据面）+ ~5 次 schema 发布的固有代价。
 **本轮不提交构建类代码改动**——所有候选要么等价性不成立，要么收益不可迁移，
 要么风险大于收益；与其带一个验证不了的风险改动上 CI，不如保持 r11 代码再抽一次签。
+
+---
+
+## 16. 第 16 轮：查询链路微移除 + 排序比较链归因（46.535 分后的继续推进）
+
+### 16.1 本轮改动
+
+| commit | 内容 | 验证 |
+| --- | --- | --- |
+| `ce8cc459f` | 查询链路微移除：缓存根 DAAT 迭代器裸指针（消除每行虚调用）、结果投影改批量、删除未用成员 `id_datum_` | 本机查询 A/B 噪声 ±25% 内不可判别；正确性 IDENTICAL |
+| `a9d514f5e` | 排序比较器单列 fast path：单键排序时缓存 collation/cmp func，消除每对比较 2 次虚 `ObIArray::at()` | 构建 CPU 秒数与旧版持平（9.4-9.8s vs 9.6s） |
+| `5ab4809fc` | datum 字符串比较直接调 collation handler：跳过 `ObCharset::strcmpsp` 每次调用的参数校验与 charset 查表（collation 是模板参数），复刻原非法输入"判等"语义 | 查询 A/B 三轮一致：qcn -6.0%、qbeng -4.7%、qmix -5.8%、qlimit -2.8%；正确性 IDENTICAL |
+
+### 16.2 构建侧 perf 重录与 self 归因（新二进制，PX_G0 = 构建 CPU 主体约 67%）
+
+| 簇 | 占比 | 说明 |
+| --- | --- | --- |
+| 排序比较链 | 约 23% | `ObSortOpImpl::Compare::operator()` 9.1%（含 `ObIArray::at()` 虚调用与 `ObDatumDesc::is_null` 5.6%）+ `ObCharset::strcmpsp` 4.9% + `std::__unguarded_partition` 3.1% |
+| ZSTD 压缩/解压 | 约 8.4% | 写 macro block 压缩 + 读解压 |
+| chunk store 写/读 | 约 8% | `ObCompactBlockWriter::add_row`/`get_row_stored_size`、`Block::get_store_row` |
+| IK 分词 | 约 5.5% | `ObIKFTParser::produce/process_next_batch` |
+| DAT 词典 | 约 3.5% | `ObArrayHashMap::find`/`match_with_code` |
+| DDL 数组遍历 | 约 3.5% | `ObIArrayWrap<ObTabletID/ObIndexType>::at` |
+
+### 16.3 newsort 实验（否决）
+
+DDL 构建 SQL 强制 `opt_param('enable_newsort','false')`。用 160 万行合成数据
+（varchar(64) utf8mb4 general_ci + bigint 主键，PX parallel(4) 有序 INSERT）
+实测：newsort=true 115.0s vs false 78.8s，**慢 46%**（sort key 编码开销超过
+memcmp 比较收益）。这就是 DDL 关闭 newsort 的原因，该方向永久否决。
+`ObOrderPerservingEncoder::can_encode_sortkey` 虽支持 UTF8MB4_GENERAL_CI，
+但编码成本在 DDL 数据量下不成立。
+
+### 16.4 构建环境故障记录（重要，影响后续所有构建）
+
+clang++-17 在部分编译单元报 `unable to rename temporary ... .o.tmp to ... .o:
+No such file or directory`（cc1 编译成功、.o.d 已生成，仅 .o rename 失败）。
+**单目标编译 100% 成功，全量 make（-j1/-j2/-j4 均复现）必败若干单元**，
+失败单元逐次变化，与并发无关（-j1 干净环境复现）。ar 链接阶段另发
+`Error running link command: SIGHUP`（后台 nohup 会话终止所致）。
+**解法**：`make -n` 提取全部编译命令后逐个串行执行（本轮 40 个单元全部
+成功），剩余链接前台 `make -j1` 一次完成（76s）。后续增量构建按此流程执行。
+
+### 16.5 小结
+
+排序比较链的虚调用分派（本轮两个提交）在查询侧拿到 3~6% 稳定收益；
+构建侧 CPU 无变化（比较器本身在构建 CPU 中占比低于采样误差）。下一轮
+候选：查询侧 `fill_merge_heap`/`copy_string_diff_row`/`collect_dims_by_id`
+（各 2.7~4.3% self）、中文 charset 比较的 SIMD 化、或消除 doc_word 全局
+排序（tokenize 产出按 word 有序，工程量大，留作后手）。
