@@ -454,6 +454,7 @@ int ObSRBMWIterImpl::fill_merge_heap_with_shallow_dims(const ObDatum *last_range
     } else if (OB_FAIL(iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
     } else {
       item.iter_idx_ = iter_idx;
+      item.id_datum_ = iter_domain_ids_[iter_idx];
       item.relevance_ = 0.0;
       if (OB_FAIL(merge_heap_->push(item))) {
       }
@@ -630,6 +631,7 @@ int ObSRBMWIterImpl::advance_dim_iters_for_next_round(
     } else if (OB_FAIL(iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
     } else if (OB_FAIL(iter->get_curr_score(item.relevance_))) {
     } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
+    } else if (FALSE_IT(item.id_datum_ = iter_domain_ids_[iter_idx])) {
     } else if (OB_FAIL(merge_heap_->push(item))) {
     }
   }

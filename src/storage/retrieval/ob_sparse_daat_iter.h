@@ -29,13 +29,17 @@ namespace storage
 
 struct ObSRMergeItem
 {
-  ObSRMergeItem() : relevance_(0.0), iter_idx_(-1), equal_with_next_(false) {}
+  ObSRMergeItem() : relevance_(0.0), iter_idx_(-1), equal_with_next_(false), id_datum_(nullptr) {}
   ~ObSRMergeItem() = default;
   TO_STRING_KV(K_(iter_idx), K_(relevance), K_(equal_with_next));
 
   double relevance_;
   int64_t iter_idx_;
   bool equal_with_next_;
+  // Doc id datum captured when the item was pushed.  The dimension iterators
+  // only advance inside fill_merge_heap(), so the datum stays valid until the
+  // item is popped, and the merge comparator avoids the iter_ids_ indirection.
+  const ObDatum *id_datum_;
 };
 
 struct ObSRMergeCmp
@@ -51,8 +55,8 @@ struct ObSRMergeCmp
       ret = OB_NOT_INIT;
     } else {
       int tmp_ret = 0;
-      const ObDatum &l_id = get_id_datum(l.iter_idx_);
-      const ObDatum &r_id = get_id_datum(r.iter_idx_);
+      const ObDatum &l_id = (OB_LIKELY(nullptr != l.id_datum_)) ? *l.id_datum_ : get_id_datum(l.iter_idx_);
+      const ObDatum &r_id = (OB_LIKELY(nullptr != r.id_datum_)) ? *r.id_datum_ : get_id_datum(r.iter_idx_);
       if (OB_LIKELY(fast_bin_string_) && OB_LIKELY(!l_id.is_null() && !r_id.is_null())) {
         cmp_ret = bin_string_cmp(l_id, r_id);
       } else if (OB_FAIL(cmp_func_(l_id, r_id, tmp_ret, nullptr))) {
@@ -172,6 +176,15 @@ protected:
   ObFixedArray<int64_t, ObIAllocator> next_round_iter_idxes_;
   int64_t next_round_cnt_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
+  // Raw data pointers of the fixed arrays above and of dim_iters_, cached in
+  // init().  Every array is allocated once by prepare_allocate() and is never
+  // reallocated before reset(), so the virtual get_data() dispatch can be
+  // replaced with a plain load on the merge hot path.  reset() clears them.
+  const ObDatum **iter_ids_data_;
+  ObDocIdExt *buffered_ids_data_;
+  double *buffered_rel_data_;
+  int64_t *next_round_idx_data_;
+  ObISRDaaTDimIter **dim_iters_data_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
 };
