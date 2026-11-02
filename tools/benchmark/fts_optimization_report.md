@@ -3326,3 +3326,90 @@ No such file or directory`（cc1 编译成功、.o.d 已生成，仅 .o rename �
 候选：查询侧 `fill_merge_heap`/`copy_string_diff_row`/`collect_dims_by_id`
 （各 2.7~4.3% self）、中文 charset 比较的 SIMD 化、或消除 doc_word 全局
 排序（tokenize 产出按 word 有序，工程量大，留作后手）。
+
+---
+
+## 17. 第 17 轮：COUNT 查询不再解码无用的 posting 列（commit `3e6be8fec`）
+
+### 17.1 动机
+
+第 3 轮做过"分数布尔化"：官方四条查询全是 COUNT 型，分数值不可观测，
+于是在 `ob_log_plan.cpp` 设 `need_calc_relevance_=false`，BM25 分数不再计算。
+
+但布尔化只关掉了**分数的计算**，没有关掉**分数的输入**。倒排索引表
+`__idx_<tid>_fti_all_ik` 的行键是 `(word_segment, doc_id)`，另有两个非行键列
+`word_count`（词频）和 `doc_length`（文档长度）。这两个列**只**被 BM25 表达式
+消费；布尔化之后 match expr 被 `mark_expr_self_produced`，过滤求值全部门控在
+`need_calc_relevance` 下，可是 code generator 仍然把它们加进扫描的 access
+exprs 和 DAS output columns，于是倒排扫描每命中一个 doc id 都要多解码两个
+posting 列——纯浪费。本轮就是把这两列从"不需要分数的扫描"里剪掉。
+
+### 17.2 改动（`src/sql/code_generator/ob_tsc_cg_service.cpp`，3 处）
+
+把条件从 `need_calc_relevance_ || nullptr != pushdown_match_filter_` 收紧为
+`need_calc_relevance_`：
+
+| 位置 | 函数 | 作用 |
+| --- | --- | --- |
+| `ob_tsc_cg_service.cpp:2331` | `extract_text_ir_access_columns` 的 `OB_IR_INV_IDX_SCAN` 分支 | 不再把 `token_cnt_column_`/`doc_length_column_` 加进 access exprs |
+| `ob_tsc_cg_service.cpp:2699` | `extract_text_ir_das_output_column_ids` 的 `OB_IR_INV_IDX_SCAN` 分支 | 不再把对应 column id 加进 DAS output columns |
+| `ob_tsc_cg_service.cpp:3036` | `generate_text_ir_spec_exprs` 的 `need_doc_length` | 布尔化后 `inv_scan_doc_length_col_` 允许为 null（token iter init 在 `!need_calc_relevance()` 时本就容忍） |
+
+安全性论证：pushdown match filter 由 retrieval iterator 自产（self produced），
+其求值全部门控 `need_calc_relevance`；序列化已支持 null expr
+（`match_filter_`/`relevance_expr_` 本就可为 null）。
+
+### 17.3 正确性
+
+`/tmp/verify_r11.sh 10104(r19) 10103(r18基线)` 两轮全部 IDENTICAL：
+tokenize（33 行）、hits（8 行）、rows（800 行）、coll（190 行）、bigcoll（3 行）。
+
+### 17.4 性能（ABBA 交错 A/B，6 轮，A=r18 基线 / B=r19）
+
+| 查询 | 形态 | delta |
+| --- | --- | --- |
+| qcn | `COUNT(*) WHERE MATCH(title,content) AGAINST('全文索引 分词器')` | **-5.40%** |
+| qbeng | `COUNT(*) WHERE MATCH(title_en,content_en) AGAINST('database performance audit')` | **-9.01%** |
+| qmix | `COUNT(*) WHERE MATCH(title,content) AGAINST('OceanBase 稳定 database')` | **-6.32%** |
+| qlimit | `COUNT(*) FROM (SELECT id ... MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20) t` | **-6.63%** |
+
+四条官方查询形态全部下降，无回归项。
+
+### 17.5 一次假阳性：冷实例 + 顺序偏差导致的 qlimit "回归"
+
+第一轮 A/B（重启后冷实例、按 arm 顺序跑的旧脚本）曾报 qlimit **+20.5%**，
+一度被当成真实回归。改用每查询内部 ABBA 交错（消除渐进漂移）并复测后为
+**-6.63%**，证实那是噪声。教训记入：qlimit 方差极大（LIMIT 20 只扫 20 个
+doc id，计时绝对值小），单轮顺序跑不可信，必须 ABBA。
+
+### 17.6 两次事故记录（都与 r19 无关，但影响后续验证方式）
+
+1. **索引指纹 `FINGERPRINT_DIFFERENT`**：两实例
+   `SUM(CRC32(CONCAT(word,'#',doc_id)))` 不同，而 count、`SUM(LENGTH(word))`、
+   `SUM(LENGTH(doc_id))` 全同。归因：doc_id 列名分别是
+   `__doc_id_1793387701382205`（10104）与 `__doc_id_1793599045240096`（10103），
+   列名里的数字就是 index table 的 table id，两者不同即两实例的全文索引表是
+   **独立创建**的；且指纹脚本本身对两边都执行了 `DROP INDEX` + `ADD INDEX`，
+   doc_id 必然重新生成。故该差异是预存差异，不是正确性回归。
+2. **两实例同时 OB_ABORT**：查询
+   `SELECT COUNT(*), MIN/MAX(__doc_id_x) FROM fts_large_bench.docs`
+   触发 `ob_array_wrap.h:53` 断言 `idx >= 0 && idx < count_`，
+   **r18 基线与 r19 候选同时崩溃**（后台 tablet create / MDS 状态检查路径）。
+   因两边二进制身份已用 md5 核对（10103=`3d923e12` r18，10104=`c9101c80` r19），
+   可确认与 r19 无关。官方 benchmark 查询不投影 `__doc_id` 虚拟列，不受影响；
+   后续验证脚本已避免该形态。
+
+### 17.7 推送目标（重要，避免推错仓库）
+
+`origin` = 上游 `oceanbase/seekdb`（无推送权限），`fork` = `lyx88815313/seekdb-fork`。
+**官方 CI 跟踪的分支是 `target` = `lyx88815313/seekdb-2026.git` 的
+`2026-competition`**。工作树处于 detached HEAD（从 `54d25bafe` 切出），
+推送命令为 `git push target HEAD:2026-competition`（fast-forward）。
+切勿 `git push origin`。
+
+### 17.8 小结
+
+布尔化分数之后继续剪掉分数的输入列，四条官方查询形态再降 5.4%~9.0%，
+是第 16 轮之后查询侧最干净的一次收益。下一步候选：倒排扫描侧仍可能存在
+的逐 doc id 接口往返（有序 posting 流的批量消费），以及构建侧 DDL 排序的
+紧凑记录格式（数据量大，风险高，留作后手）。
