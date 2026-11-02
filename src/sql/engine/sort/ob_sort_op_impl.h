@@ -468,6 +468,7 @@ public:
     {
       cmp_start_ = cmp_start;
       cmp_end_ = cmp_end;
+      refresh_single_col_mode();
     }
 
   public:
@@ -482,6 +483,24 @@ public:
     int64_t cmp_end_;
   private:
     int64_t cnt_;
+    // single-column fast path: cache the collation and cmp func of a one-key
+    // sort so each comparison avoids the virtual ObIArray::at() lookups.
+    bool single_col_mode_;
+    const ObSortFieldCollation *single_collation_;
+    const ObSortCmpFunc *single_cmp_;
+    void refresh_single_col_mode()
+    {
+      single_col_mode_ = (nullptr != sort_cmp_funs_ && nullptr != sort_collations_
+          && 1 == cnt_ && 1 == sort_cmp_funs_->count() && 1 == sort_collations_->count()
+          && 0 == cmp_start_ && 1 == cmp_end_);
+      if (single_col_mode_) {
+        single_collation_ = &sort_collations_->at(0);
+        single_cmp_ = &sort_cmp_funs_->at(0);
+      } else {
+        single_collation_ = nullptr;
+        single_cmp_ = nullptr;
+      }
+    }
     DISALLOW_COPY_AND_ASSIGN(Compare);
   };
 
