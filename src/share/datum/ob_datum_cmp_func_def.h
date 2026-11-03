@@ -395,17 +395,36 @@ struct ObDatumStrCmpImpl
       // Call the collation handler directly.  ObCharset::strcmpsp re-validates
       // its arguments and looks the charset up on every call, which the datum
       // sort/compare hot path pays once per comparison; the collation is a
-      // template parameter here, so the lookup is hoisted out of the loop.
+      // template parameter here, so the charset info and its handler are
+      // resolved once on the first comparison of the process and reused after
+      // that.  The charset table is filled in before any row is ever compared,
+      // and an entry never changes afterwards, so caching it is safe.
       // Invalid inputs keep the original outcome of comparing equal.
+      struct CachedCollation
+      {
+        const ObCharsetInfo *cs_info;
+        int (*strnncollsp)(const ObCharsetInfo *, const unsigned char *, size_t,
+                           const unsigned char *, size_t, bool);
+      };
+      static const CachedCollation cached_collation = [cs] {
+        CachedCollation cached = {nullptr, nullptr};
+        const ObCharsetInfo *cs_info = ObCharset::get_charset(cs);
+        if (OB_NOT_NULL(cs_info) && OB_NOT_NULL(cs_info->coll)
+            && OB_NOT_NULL(cs_info->coll->strnncollsp)) {
+          cached.cs_info = cs_info;
+          cached.strnncollsp = cs_info->coll->strnncollsp;
+        }
+        return cached;
+      }();
       const unsigned char *lp = reinterpret_cast<const unsigned char *>(l.ptr_);
       const unsigned char *rp = reinterpret_cast<const unsigned char *>(r.ptr_);
-      const ObCharsetInfo *cs_info = ObCharset::get_charset(cs);
-      if (OB_UNLIKELY(nullptr == cs_info)
+      if (OB_UNLIKELY(nullptr == cached_collation.cs_info)
           || OB_UNLIKELY((nullptr == lp && 0 != l.len_))
           || OB_UNLIKELY((nullptr == rp && 0 != r.len_))) {
         cmp_ret = 0;
       } else {
-        cmp_ret = cs_info->coll->strnncollsp(cs_info, lp, l.len_, rp, r.len_, with_end_space);
+        cmp_ret = cached_collation.strnncollsp(cached_collation.cs_info, lp, l.len_,
+                                               rp, r.len_, with_end_space);
         cmp_ret = cmp_ret > 0 ? 1 : (cmp_ret < 0 ? -1 : 0);
       }
     }

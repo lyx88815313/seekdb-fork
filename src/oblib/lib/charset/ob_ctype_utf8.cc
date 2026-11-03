@@ -345,9 +345,19 @@ static inline bool ob_utf8mb4_general_ci_fast_weight(const unsigned char *&p,
     weight = (c >= 0x61 && c <= 0x7A) ? (uint32_t)(c - 0x20) : (uint32_t)c;
     p += 1;
     return true;
-  } else if (c >= 0xE0 && c < 0xF0 && p + 3 <= end
-             && IS_CONTINUATION_BYTE(p[1]) && IS_CONTINUATION_BYTE(p[2])
-             && (c >= 0xE1 || p[1] >= 0xA0)) {
+  } else if (OB_LIKELY((uint8_t)(c - 0xE0) < 0x10) && OB_LIKELY(p + 3 <= end)) {
+    // Both continuation bytes are tested with one 16 bit load.  The mask is
+    // symmetric under a byte swap, so the check does not depend on the byte
+    // order.  p + 3 <= end has already guaranteed that p[1] and p[2] exist.
+    uint16_t cont = 0;
+    memcpy(&cont, p + 1, sizeof(cont));
+    if (OB_UNLIKELY((cont & 0xC0C0) != 0x8080)) {
+      return false;
+    }
+    if (OB_UNLIKELY(0xE0 == c && p[1] < 0xA0)) {
+      // overlong encoding: ob_mb_wc_utf8mb4() rejects it
+      return false;
+    }
     const uint32_t wc = (((uint32_t)(c & 0x0F)) << 12)
                       | (((uint32_t)(p[1] & 0x3F)) << 6)
                       |  ((uint32_t)(p[2] & 0x3F));
@@ -519,6 +529,31 @@ static int ob_strnncollsp_utf8mb4(const ObCharsetInfo *cs,
     if (OB_FAST_DONE == walk) {
       return fast_ret;
     } else if (OB_FAST_TAIL == walk) {
+      // The walk stops only once one side ran out of characters, so the two
+      // remainders are (0, n) or (n, 0).  When trailing spaces are ignored the
+      // shared helper reduces to: both exhausted means equal, otherwise the
+      // longer remainder decides and only when it holds something other than a
+      // space.  Spelling that out keeps the noinline helper, with its nine
+      // by-reference arguments, off the equal-key comparisons that dominate a
+      // sort; anything the shortcut does not recognise falls through to it.
+      if (OB_LIKELY(!diff_if_only_endspace_difference)) {
+        const int64_t rem_s = se - s;
+        const int64_t rem_t = te - t;
+        if (OB_LIKELY(0 == rem_s && 0 == rem_t)) {
+          return 0;
+        } else if (OB_LIKELY(rem_s != rem_t)) {
+          const unsigned char *p = (rem_s > rem_t) ? s : t;
+          const unsigned char *pe = (rem_s > rem_t) ? se : te;
+          const int swap = (rem_s > rem_t) ? 1 : -1;
+          while (p < pe) {
+            if (OB_UNLIKELY(' ' != *p)) {
+              return (*p < ' ') ? -swap : swap;
+            }
+            ++p;
+          }
+          return 0;
+        }
+      }
       int res = 0;
       int has_returned = 0;
       int tmp = ob_strnncollsp_utf8mb4_help(
