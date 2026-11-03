@@ -3552,3 +3552,126 @@ tokenize 的 44% 和 query 的 60%），下一轮应继续在 build 链路上找
    C++ 单元**——cmake 的 depend 阶段会刷新依赖。不能信 `make -n` 的单元数。
 2. 前台 `make -j1 seekdb` 超过工具 300s 超时会被杀（链接未完成，二进制
    mtime 不变）。必须 `setsid -f` 脱离会话，日志 `/tmp/r20_link.log`。
+
+---
+
+## 19. 第 21 轮：排序比较器缓存多列 collation / cmp func（r21）
+
+### 19.1 动机
+
+16.2 的构建侧 perf 自归因显示 `ObSortOpImpl::Compare::operator()` 占构建 CPU
+**9.1%**，其中 `ObIArray::at()` 虚调用 + `ObDatumDesc::is_null` 合计 **5.6%**。
+16 轮已经给**单列**排序加过快路径（`single_col_mode_`，commit `ad578ee7f`），
+但倒排索引构建与 DDL 走的是**多列**排序，落不到那条快路径上：每比较一次，
+每一列都要走两次虚 `ObIArray::at()`（一次取 `ObSortFieldCollation`、
+一次取 `ObSortCmpFunc`），而这些内容在一次排序的生命周期里**从不变化**。
+
+本轮就是把这个"每次比较都重新取一遍"的常量数组，在 `init()` 时一次性缓存成
+裸指针数组。
+
+### 19.2 改动（`src/sql/engine/sort/ob_sort_op_impl.{h,cpp}`）
+
+`Compare` 新增三个成员：
+
+```cpp
+static const int64_t MAX_CACHED_CMP_COL = 8;
+int64_t cached_cnt_;
+const ObSortFieldCollation *cached_collations_[MAX_CACHED_CMP_COL];
+const ObSortCmpFunc *cached_cmps_[MAX_CACHED_CMP_COL];
+```
+
+`refresh_single_col_mode()`（`init()` 与 `set_cmp_range()` 都会调用）里填充：
+`cached_cnt_` 受 **四重封顶**——`cnt_`、`sort_cmp_funs_->count()`、
+`sort_collations_->count()`、`MAX_CACHED_CMP_COL`，然后按 `cached_cnt_` 存下
+前若干列的指针。
+
+四个比较循环全部改为"命中缓存用裸指针、否则回退 `at(i)`"：
+
+| 位置 | 函数 |
+| --- | --- |
+| `ob_sort_op_impl.cpp:437` | `Compare::operator()(StoredRow, StoredRow)` |
+| `ob_sort_op_impl.cpp:477` | `Compare::operator()(Expr*, StoredRow)` |
+| `ob_sort_op_impl.cpp:518` | `Compare::with_ties_cmp(Expr*, StoredRow)` |
+| `ob_sort_op_impl.cpp:553` | `Compare::with_ties_cmp(StoredRow, StoredRow)` |
+
+### 19.3 等价性论证
+
+1. 缓存的是**同一对象的地址**（`&sort_collations_->at(i)`），不是拷贝，
+   对象内容变化时指针仍指向同一存储，语义不变。
+2. `Compare::init()` 一定先于任何比较执行；`comp_.init()` 在
+   `ObSortOpImpl::init()` 里只做一次，之后排序键集合不再变化。
+3. `ObIArrayWrap::at()` 无副作用（纯索引访问 + 断言），省掉它不改变行为。
+4. 四重封顶保证 `i < cached_cnt_` 时 `cached_collations_[i]` /
+   `cached_cmps_[i]` 必然已被赋值，不存在未初始化读。
+5. 构造函数把 `cached_cnt_` 置 0 并 MEMSET 两个指针数组，
+   `init()` 之前的任何路径都走回退分支。
+
+### 19.4 正确性
+
+`/tmp/verify_r11.sh 10106(r21) 10104(r20)` 五项全部 **IDENTICAL**：
+tokenize（33 行）、hits（8 行）、rows（800 行）、coll（190 行）、bigcoll（3 行）。
+
+`/tmp/index_fp.sh 10106 A` + `10104 B`（各自重建 `fti_all_ik` 后取指纹）：
+CRC32 指纹 **IDENTICAL** —— `20000 / 42831911601292 / 5832098 / 320000`。
+
+### 19.5 性能（同会话 A/B，A=r20/10104，B=r21/10106）
+
+查询 ABBA 6 轮（`/tmp/ab_r21.sh`）：
+
+| 查询 | A (ms) | B (ms) | delta |
+| --- | --- | --- | --- |
+| qcn | 1.5506 | 1.5645 | +0.9% |
+| qbeng | 2.0590 | 2.1060 | +2.3% |
+| qmix | 1.6545 | 1.6367 | −1.1% |
+| qlimit | 0.8110 | 0.8260 | +1.8% |
+
+四条查询全部落在噪声带内、不可判别——**符合预期**：官方四条查询都是 COUNT 型，
+不带 ORDER BY，根本不进排序算子。
+
+构建 ABBA 4 轮（`ALTER TABLE fts_large_bench.docs_ab ADD FULLTEXT INDEX
+fti_ab(title, content) WITH PARSER ik`，20000 行，`/tmp/build_ab_r21.sh`）：
+
+| 轮次 | A (ms) | B (ms) | 配对差分 |
+| --- | --- | --- | --- |
+| 1 | — | — | −0.383 |
+| 2 | — | — | −3.703 |
+| 3 | — | — | −1.761 |
+| 4 | — | — | −0.272 |
+| **均值** | **33891** | **32361** | **−4.5%** |
+
+4/4 配对全部偏向 r21，方向一致，但 n=4、t≈1.9 **未达统计显著**，
+因此只能说"方向一致"，不能说"已验证提升"。
+
+**本机读数不外推**：测量期间本机处于极慢状态（load 2.26、4 核、
+`build_ik_all` ~55 s、`select1` 0.19 ms），构建是 I/O / 编排受限而非 CPU 受限
+（15.1：45 s 墙钟只有 16 CPU 秒）。而 CI 上构建是 **CPU 受限**的（第 8 轮只改
+Rust 页校验和就让 `build_ik_all` +25.64%，那是纯 CPU 改动）。因此这类纯 CPU
+优化在 CI 上的可见度**应当高于本机的 −4.5%**——这是把 r21 推出去测官方 CI 的
+主要理由。
+
+### 19.6 小结与下一轮候选
+
+本轮把 16.2 归因出的 5.6% 里的"多列排序每次比较重取常量数组"这部分消掉，
+等价性靠"缓存同一对象地址 + 四重封顶"保证，正确性零差异，构建侧方向性收益
+−4.5%。查询侧按机制分析本就不该有变化，实测确认。
+
+下一轮候选（按期望值排序）：
+
+1. 用 r20/r21 二进制**重新录一次构建侧 perf**，确认 `ObIArray::at()` 是否真的
+   从热点里消失（当前 −4.5% 只是间接证据）。
+2. `ObIArrayWrap<ObTabletID / ObIndexType>::at` 的 DDL 数组遍历
+   （16.2 记 3.5%）。
+3. 解码器的"批次不变量外提"：每批 / 每块不变的编码类型、列布局、元数据是否被
+   逐行重复判断；COUNT 列裁剪后是否仍初始化不需要的通用解码状态。
+   **前提是采样证据**，没有调用栈证据不动共享解码器。
+
+明确不做：关 zstd 压缩（投机取巧）、newsort（实测慢 46%）、
+缩短 DDL 轮询间隔（已证明无效）、共享快照 / 跳过 VALIDATE_CHECKSUM
+（等价性不成立）。
+
+### 19.7 工作树里的无关改动（未提交）
+
+工作树中另有 4 个 `src/sql/engine/expr/ob_expr_ai/` 文件处于已修改未提交状态
+（CRLF 行尾 + `set_string_result` 增加 `batch_idx` 参数等），来自本会话早期
+一个子代理的探索，与 FTS 优化无关。**本轮提交只包含 sort 两个文件**，
+这些改动继续留在工作树里，不进入 `target/2026-competition`。
