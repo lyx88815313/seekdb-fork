@@ -3675,3 +3675,142 @@ Rust 页校验和就让 `build_ik_all` +25.64%，那是纯 CPU 改动）。因�
 （CRLF 行尾 + `set_string_result` 增加 `batch_idx` 参数等），来自本会话早期
 一个子代理的探索，与 FTS 优化无关。**本轮提交只包含 sort 两个文件**，
 这些改动继续留在工作树里，不进入 `target/2026-competition`。
+
+---
+
+## 20. 第 22 轮：utf8mb4 比较链的解析开销（commit `176185df9`）
+
+### 20.1 先重新读题：计分口径与基线的真实性质
+
+在动手之前把 `tools/benchmark/fts_large_bench_score.py` 与
+`fts_large_bench_baseline.json` 重新读了一遍，把口径彻底钉死：
+
+- 三个类：`build`（3 项）、`tokenize`（2 项）、`query`（4 项）；
+- **类内先平均，三类再等权平均**；
+- `score = clamp(mean_improvement, 0, 0.5) / 0.5 * 100`，本地脚本满分 100，
+  官方满分 50，二者相差一个因子 2。用户口头说的"分数"就是
+  `fts_mean_improvement × 100`（39.455 分 ↔ `fts_raw_score` 78.910）。
+
+仓库里 checked-in 的 `fts_large_bench_baseline.json`（2026-07-07 五次 VLDB CI
+平均，`build_ik_all_sec` = 35.28 s）**不是 CI 实际使用的基线**：拿它算
+`4fe2611f0` 会得到 mean 约 89%、score 约 89，而官方只给 39.455。
+CI 的基线是**每次在 master 上重新实测**的，会随 master 的演进而移动，
+这解释了 18.1 节那次"指标全面变快、分数反而跌 8.2 分"的反常。
+
+**由此得到两条操作性结论**：
+
+1. 分数带 ±8pp 量级的运行间噪声。**要稳拿 50，实际得把
+   `mean_improvement` 做到 0.55 以上**，不能卡着 0.50。
+2. 每 1% 的相对提速值多少分，只取决于该类当前处在什么位置：
+   `Δ分 = 0.01 × (1 − 该类提升率) / 3 × 100`。
+   **提升率越低的类，每 1% 越值钱。** 按第 8 轮官方分项反推的 master
+   实测值换算，第 21 轮大致是 build 17%~25%、tokenize 40%~47%、
+   query 63%~66%，即 build 每 1% 约值 0.25~0.28 分，query 只有 0.11~0.12 分。
+   所以主攻方向仍然是 build，query 侧的边际收益已经很小。
+
+### 20.2 重新下钻构建段剖析：把"32% DTL 接收"这条旧结论拆开
+
+第 16~21 轮一直把"`get_next_row → get_next_batch` 占 32%"当成 DTL 接收成本。
+用 `drill.py` 对 `/tmp/r21c/raw.txt` 重新按调用关系下钻后，这条结论需要修正：
+
+| 调用链 | 占构建采样 |
+| --- | --- |
+| `get_next_batch_with_onlyone_row` → `ObOperator::get_next_row` | 61%（1654/2703） |
+| `process_sort_batch` → `scan_all_then_sort_batch` | 26%（709/2703） |
+| `do_range_dist` → `send_rows_in_batch<10>` | 22%（606/2703） |
+| `scan_all_then_sort_batch` → `before_add_row` → `do_dump` | 11%（288/2703） |
+| `ObOperator::get_next_row` → `ObTableScanOp::inner_get_next_row` | 15%（398/2703） |
+
+其中 `before_add_row` 自身 self 只有 2%，它的 11% 几乎全是 `do_dump()`——
+也就是说**排序的溢出落盘路径本身是自洽的，`before_add_row` 每行做的
+`EVENT_CALL` / 内存周期检查并不贵**（`EventTable::item_.call` 生产构建下
+就是一次函数指针判空）。
+
+同时确认了两条此前的误判：
+
+- `ObIArrayWrap<T>::at` 显示 3.70% 是**符号区间误判**：它是 header 里的
+  `inline` 三行函数，调用方分散在 compact block 读写等多处，不可能各自
+  值 1~2%。与 11.5 节 `absl::LowLevelAlloc::Alloc` 的 13.98% 同一类问题。
+- 排序比较链的真实占比是
+  `ObNullSafeDatumStrCmp<45>::cmp` 6.29% + `ob_strnncollsp_utf8mb4` 3.07%
+  + `ObCharset::get_charset` 0.85% + `ObSortOpImpl::Compare::operator()` 1.74%
+  + `ObNullSafeDatumStrCmp<63>::cmp` 1.59% ≈ **13.5%**。
+  注意 `<45>` 的 self（6.29%）是它的 callee（3.07%）的两倍：
+  **包装开销比被包装的真实比较多一倍**，这是本轮唯一抓得住的形状。
+
+### 20.3 本轮改动
+
+`src/share/datum/ob_datum_cmp_func_def.h` 的 `ObDatumStrCmpImpl::cmp`，
+非 binary 分支原来每次比较都：
+
+```
+cs_info = ObCharset::get_charset(cs)      // 跨 TU 函数调用：范围检查 + 数组加载
+cs_info->coll->strnncollsp(...)           // 两次依赖加载 + 间接调用
+```
+
+`cs` 是模板参数，所以 `ObCharsetInfo*` 与它的 `strnncollsp` 处理器在整个
+进程生命周期里是常量。改成函数局部 `static`（magic static，首次比较时解析，
+之后只剩一次守卫位判断 + 两次加载）：
+
+```cpp
+static const CachedCollation cached_collation = [cs] {
+  CachedCollation cached = {nullptr, nullptr};
+  const ObCharsetInfo *cs_info = ObCharset::get_charset(cs);
+  if (OB_NOT_NULL(cs_info) && OB_NOT_NULL(cs_info->coll)
+      && OB_NOT_NULL(cs_info->coll->strnncollsp)) {
+    cached.cs_info = cs_info;
+    cached.strnncollsp = cs_info->coll->strnncollsp;
+  }
+  return cached;
+}();
+```
+
+非法输入（charset 未就绪 / 空指针带非零长度）仍旧走"比较相等"的旧分支，
+语义完全不变。
+
+`src/oblib/lib/charset/ob_ctype_utf8.cc` 两处，来自更早一轮未提交的工作树
+改动（本轮一并提交，因为改的是同一条 utf8mb4_general_ci 比较路径）：
+
+- `ob_utf8mb4_general_ci_fast_weight`：原来用三次加载 + 三个分支判断两个
+  延续字节，改成一次 16 位加载 + 对称掩码（`(cont & 0xC0C0) != 0x8080`），
+  字节序无关；overlong 编码单独保留一次判断。
+- `ob_strnncollsp_utf8mb4`：尾空格差异情形直接算出结果，不让带 9 个引用
+  参数的 noinline helper 占掉排序里占多数的"等键"比较。
+
+### 20.4 正确性验证
+
+r22+r23 二进制（md5 `34899e6cc106c0a08f93d1a2f595c69c`，端口 10108）对
+r22 二进制（md5 `a7e0a914d1bf619564e3ca224554687f`，端口 10107）：
+
+- 5 类 TOKENIZE（中文长文本 / 英文长文本 / 地名专名 / 中英混合 / 纯英文）
+  输出逐字节一致；
+- 四条官方查询形态命中数 8001 / 11000 / 7332 / 20 一致；
+- `MATCH(content) AGAINST('分词器 热路径')` 前 50 个 id 序列一致；
+- 不存在词条的查询返回 11999（全表）一致。
+
+### 20.5 性能
+
+本机构建段 wall clock 受 I/O 等待支配（wall 34s vs observer CPU 11s），
+只有 observer 进程 `utime+stime` 可信。用 `/tmp/cpu_ab_r22.sh` 做 ABBA
+交错 A/B（A = r22，B = r22+r23，各 5 轮）：
+
+| 索引 | A 均值 (s) | B 均值 (s) | 逐轮几何均值 |
+| --- | --- | --- | --- |
+| `fti_ab`（title+content, ik） | 11.302 | 11.056 | **−2.1%** |
+| `fti_ab2`（content, ik） | 10.303 | 9.833 | **−3.3%** |
+
+方向与剖析预测一致（比较链 13.5% 中可去掉的那部分），但幅度只有
+2~3%，且逐轮抖动 ±5%，**单轮读数不可信**。折算约 +1.7~2.5pp 的 build
+提升率、+0.6~0.8 分，低于官方读数的噪声带。
+
+### 20.6 小结与下一步
+
+- 比较链的包装开销确实存在且已去掉，但**它不足以单独改变分数量级**。
+- 仍然成立的结构性事实：构建段 CPU 的大头是**有序插入的逐行路径**
+  （61%）与**排序输出/落盘**（26%），DTL 收发只占其中一小段叶子成本。
+  第 16.5 节记的"消除 doc_word 全局排序"仍是唯一可能带来量级变化的
+  方向，但工程量大、风险高。
+- 下一轮候选：查询侧 `fill_merge_heap` / `copy_string_diff_row` /
+  `collect_dims_by_id`（各 2.7~4.3% self）；以及先取一次 CI 的
+  `build_improvement` / `tokenize_improvement` / `query_improvement`
+  三个分项，把 20.1 节里那个 ±8pp 的估计区间收窄，再决定往哪一类继续投。
