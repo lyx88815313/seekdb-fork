@@ -249,8 +249,10 @@ int ObSimpleRowsMerger<T, Comparator>::pop()
     ret = OB_EMPTY_RESULT;
     STORAGE_LOG(WARN, "The merger is empty", K(ret), K(*this));
   } else {
-    for (int64_t i = 0; i < item_cnt_ - 1; ++i) {
-      items_[i] = items_[i+1];
+    // One pop per merged row: shifting the handful of remaining items with a
+    // single memmove is cheaper than an element wise copy of a 40 byte item.
+    if (item_cnt_ > 1) {
+      memmove(items_, items_ + 1, sizeof(T) * static_cast<size_t>(item_cnt_ - 1));
     }
     --item_cnt_;
   }
