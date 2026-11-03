@@ -482,12 +482,21 @@ public:
     int64_t cmp_start_;
     int64_t cmp_end_;
   private:
+    // A sort compares its keys far more often than it reconfigures them, so the
+    // collation and cmp func descriptors are copied once at init instead of
+    // being refetched through the virtual ObIArray::at() on every comparison.
+    static const int64_t MAX_CACHED_CMP_COL = 8;
     int64_t cnt_;
     // single-column fast path: cache the collation and cmp func of a one-key
     // sort so each comparison avoids the virtual ObIArray::at() lookups.
     bool single_col_mode_;
     const ObSortFieldCollation *single_collation_;
     const ObSortCmpFunc *single_cmp_;
+    // multi-column cache, filled for the first MAX_CACHED_CMP_COL keys.  Keys
+    // beyond the cached range keep using the array lookup.
+    int64_t cached_cnt_;
+    const ObSortFieldCollation *cached_collations_[MAX_CACHED_CMP_COL];
+    const ObSortCmpFunc *cached_cmps_[MAX_CACHED_CMP_COL];
     void refresh_single_col_mode()
     {
       single_col_mode_ = (nullptr != sort_cmp_funs_ && nullptr != sort_collations_
@@ -499,6 +508,20 @@ public:
       } else {
         single_collation_ = nullptr;
         single_cmp_ = nullptr;
+      }
+      cached_cnt_ = (nullptr != sort_cmp_funs_ && nullptr != sort_collations_) ? cnt_ : 0;
+      if (cached_cnt_ > sort_cmp_funs_->count()) {
+        cached_cnt_ = sort_cmp_funs_->count();
+      }
+      if (cached_cnt_ > sort_collations_->count()) {
+        cached_cnt_ = sort_collations_->count();
+      }
+      if (cached_cnt_ > MAX_CACHED_CMP_COL) {
+        cached_cnt_ = MAX_CACHED_CMP_COL;
+      }
+      for (int64_t i = 0; i < cached_cnt_; i++) {
+        cached_collations_[i] = &sort_collations_->at(i);
+        cached_cmps_[i] = &sort_cmp_funs_->at(i);
       }
     }
     DISALLOW_COPY_AND_ASSIGN(Compare);
