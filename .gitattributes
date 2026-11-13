@@ -20,3 +20,7 @@ minivectordb/src/*.cpp text eol=lf
 minivectordb/src/*.hpp text eol=lf
 minivectordb/benchmark/*.py text eol=lf
 minivectordb/tests/*.py text eol=lf
+conversation.json text eol=lf
+agent/conversation.json text eol=lf
+README.md text eol=lf
+docs/*.md text eol=lf
