@@ -1,138 +1,742 @@
 {
   "title": "MiniVectorDB（2026-competition-round2）开发过程记录",
   "task": "按照赛题一的要求，从官方仓库 oceanbase/seekdb 的 2026-competition-round2 分支出发，实现一个支持 SQL、持久化存储与事务的轻量向量数据库 MiniVectorDB，提交源码、Dockerfile 与 conversation.json。",
-  "material_scope": "本文件记录的是本仓库当前提交所对应版本的真实开发过程：用户 prompt（学生来源）、Agent 的分析与工具输出（Agent 来源）、以及实际执行过的实验与结果（工具来源）。没有执行的计划单独放在 planned_but_not_executed 中，不计入结果类证据。",
+  "material_type": "actual_development_record",
+  "synthetic": false,
+  "material_scope": "本文件记录本次赛题开发过程的真实材料，由两部分组成：(1) 本仓库当前提交所对应实现（minivectordb/ 目录）的开发过程，包含用户 prompt、Agent 的分析与工具输出、以及实际执行过的实验与结果；(2) 更早一版实现（同一赛题、另一个工作目录）的开发记录，原样取自那一版实现自己的 agent/conversation.json，属于过程证据，不是本次提交物的组成部分。两部分用 origin 字段区分：current 表示当前实现，earlier_attempt 表示早期方案。没有执行的计划单独放在 planned_but_not_executed 中，不计入结果类证据。",
+  "material_sections": {
+    "current": "本仓库当前提交对应的实现，提交物为 minivectordb/ 源码、Dockerfile 与本文件。",
+    "earlier_attempt": "更早一版实现的开发记录。该版本基于同一官方基线 f4d4e2665 另起实现，共 25 个提交，公开用例 20/20 通过、崩溃恢复 10 场景通过，但连续五次正式提测都被平台判为「失败用例数 1：JSON response timeout」，根因到最后都没有确认；它的 Dockerfile 未锁基础镜像 digest 与依赖版本，错误码也几乎全部收敛为 sql_error。它当时的记录写的是：官方公开 mysqltest 基础用例已合入；正式协议、错误码和完整驱动尚未提供。"
+  },
   "redaction_note": "服务器地址、SSH 用户名与口令属于访问凭据，已全部省略；GitHub 访问令牌同样未写入本文件。对话中出现的真实错误信息、文件名、函数名与测量数值均未修改。",
   "user_prompts": [
     {
+      "id": "ea-u1",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "你先分析研究一下2026-competition-round2，然后结合下面几个思路。"
+    },
+    {
+      "id": "ea-u2",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "更具你的思路来，可以开始着手工作了"
+    },
+    {
+      "id": "ea-u3",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "下一步请完成“功能准入收尾第一阶段：外部排序与流式结果处理”。"
+    },
+    {
+      "id": "ea-u4",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "合并官方公开用例并完成本地适配验证,不要实现 ANN、SIMD、checkpoint 或日志压缩，也不要猜测正式协议"
+    },
+    {
+      "id": "ea-u5",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "合并官方提交，升级 tests/run_public_cases.py 支持 --restart、--mode ann 和 error 断言；先运行再做最小修复，最终完成全部回归并提交。"
+    },
+    {
+      "id": "ea-u6",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "我认为追加日志和 CRC 断尾检测可处理不完整尾部，但风险在 COMMIT 已落盘而未响应、恢复更新主键哈希目录两个阶段。已确认 COMMIT 必须保留，未请求提交必须回滚，未知提交只能完整生效或不生效，重复恢复不能重复应用修改；请用确定性故障注入检查。"
+    },
+    {
+      "id": "ea-u7",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "下一阶段完成正式 stdin/stdout JSON Lines 协议适配与官方检查器验证。先合并并阅读官方协议，实现正式 JSON Lines 协议，严格实现响应类型，保留有界内存的流式输出，迁移测试客户端，使用官方检查器实际验证"
+    },
+    {
+      "id": "ea-u8",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "完成超内存数据处理与 cgroup v2 资源验证，先通过实验判断真实瓶颈，不做没有测量依据的优化。检查独立 cgroup 权限；实现参数化大数据测试，以独立流式参考验证结果，比较 N/2N 的内存、耗时、I/O、日志和恢复扩展性。"
+    },
+    {
+      "id": "ea-u9",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "主键等值 UPDATE/DELETE 不应扫描全部可见记录；磁盘哈希目录可定位已提交记录，再与事务覆盖层合并。请先用 N/2N 和多轮中位数记录基线，再统一 SELECT/UPDATE/DELETE/TopK 点查，验证覆盖层优先级、AND 剩余条件、affected_rows、日志与崩溃语义，并完成对照和回归。"
+    },
+    {
+      "id": "ea-u10",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "完成 Docker 镜像构建与容器内官方协议验证。若失败先区分构建依赖、入口参数、协议传输和数据库行为，不直接修改核心；按赛题要求存放 conversation.json。"
+    },
+    {
+      "id": "ea-u11",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "精确 TopK 的主要成本可能来自记录读取、L2 距离计算和临时对象分配。SIMD 或减少拷贝可能改善查询，而 ANN 会增加索引构建 I/O 和内存，不能默认综合性能更好。先测量三轮基线和 profiling，只提出候选，等待我选择第一项优化。"
+    },
+    {
+      "id": "ea-u12",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "选择第一项：语句级解析与距离复用。只做这一项，不同时实现缓冲复用、平方距离、SIMD、ANN或checkpoint。预测查询向量逐记录解析和重复计算若是主要额外成本，则T应明显下降、B基本不变、M不变或略降；若T仍接近134ms，应接受结果并把下一瓶颈调整到记录读取、行解码或输出。要求每语句解析一次、每条通过WHERE的记录只算一次、TopK排序输出复用距离，保持float32/double/sqrt/并列/事务/ann回退和原错误及输出格式。需要测试构建运行计数、基线逐响应差分、三轮T/B/M及Recall证据。"
+    },
+    {
+      "id": "ea-u13",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "选择第二项：读取/解码缓冲区复用与减少拷贝。上一项使整体T下降23.8%，但过滤TopK仅3–4%，瓶颈可能转向记录读取、解码和临时对象。预计B基本不变、M不变或略降；只复用日志/行缓冲并减少OutputRow拷贝，保持PreparedQuery、距离复用、存储、事务、外部排序和JSONL。重点防范悬垂引用：TopK与排序段必须拥有稳定数据，不能保存复用缓冲视图。需要parse-reuse逐响应差分、ASan/UBSan、三轮新增收益；若收益不明确或生命周期风险大于收益，应撤销而非强留。"
+    },
+    {
+      "id": "ea-u14",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "下一阶段做有界小表精确查询缓存。先提交第二阶段成果。缓存仅服务已提交小表，配置总字节预算，0禁用；按对象/字符串/向量/容器计大小，超预算立即释放并回退。只有无活动事务查询使用，提交后按表失效，失败/ROLLBACK不发布，重启按已提交状态重建，主键点查不变。需要缓存开关差分、固定种子增删改查、ASan/UBSan、超预算有界回退，以及冷构建与热查询三轮T/B/M。直接对照buffer-reuse的99.488秒，只有正确、大表有界、稳定明显收益且资源代价合理才保留并提交。"
+    },
+    {
+      "id": "ea-u15",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "进行精确语义保持的L2 SIMD实验。缓存后无过滤TopK更可能受益；若两条路径几乎不改善，热点已转移，不应增加复杂度。要求double差值/平方/累加、原求和顺序和sqrt，不用f32、fast-math、FMA、近似sqrt或lane重归约；保留标量回退、运行时AVX2分派和开关。需要位级/JSON差分、尾部sanitizer、完整1000查询三轮对照64be9141。若保序SIMD无稳定收益，保留记录并撤销，不能改用不精确替代。"
+    },
+    {
+      "id": "ea-u16",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "3aa6167和64be9141提测均出现JSON response timeout。先检查未覆盖路径而非直接认定flush或性能问题。我怀疑隐藏用例数据规模、恢复耗时、正式传输/协议版本或入口差异，需要取得证据再修复。请优先核对协议并做原始管道验证，若不能复现应继续找具体错误路径。"
+    },
+    {
+      "id": "ea-u17",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "进行双线程并行缓存精确TopK实验。公开2 CPU且缓存只读，适合并行。仅无事务且缓存命中的TopK启用，点查/事务/大表/普通ORDER BY不变；持久工作线程池，按连续区间独立WHERE、标量double L2和局部K堆，主线程合并。配置1/2线程，TSan/ASan检查，三轮比较热T/B/M/CPU。收益不足则撤销。"
+    },
+    {
+      "id": "ea-u18",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "进行缓存TopK普通列等值过滤特化。通用WHERE逐行类型分派可能有成本，单列VARCHAR等值直接比较可降低带过滤查询并改善双线程扩展；无过滤/B/M应不变。只处理非事务缓存TopK的单条件普通列等值，主键仍点查，AND/范围/VECTOR/大表不特化。使用string_view避免分配，通用开关差分、固定种子、TSan/ASan和三轮对照310981d；收益不明确则撤销。"
+    },
+    {
+      "id": "ea-u19",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "下一阶段只做缓存TopK直读与最终K行延迟物化。先审计全局缓存预算、临时/失效/负缓存累积和worker生命周期；如有真实无界增长或生命周期问题则停止性能实验。学生预测：过滤特化已证明不匹配记录不构造Row有益，但匹配记录和候选仍携带完整行；扫描只需主键、向量、过滤字段和缓存位置，轻量候选加最终K行投影可能减少CPU和临时内存，不改变距离；若收益仍小才考虑物理布局。限定无事务、缓存命中、非主键、单双线程、无过滤或PreparedEquality；点查、事务、大表、普通查询、日志、恢复和失效策略不变。候选只存distance/primary_key/row_index，保持float32、double、sqrt、求和顺序，提供DISABLE_LAZY_TOPK差分。要求完整投影/事务/ann/大表/固定种子差分、TSan/ASan/UBSan/LSan、三轮T/B/M含完整窗口B、冷构建、物化计数和候选大小；收益不足则撤销。将预测、证据和取舍写入conversation后等待选择。"
+    },
+    {
+      "id": "ea-u20",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "下一阶段只做缓存内低基数VARCHAR等值过滤倒排索引，直接基线26e3fb4热T=3.065s、无过滤3.763ms、过滤2.704ms、M=17.730MiB、完整B=6,340,608B。学生预测：过滤匹配率约3.1%，绝大多数扫描不参与距离；缓存构建时为低基数列建立值到行号postings可能显著降低过滤T，无过滤应不变，索引会增加少量构建和M，高基数必须放弃。限定无事务、缓存、非主键、单VARCHAR PreparedEquality；最多64值，索引全部计入全局16MiB，超基数/预算只跳索引，缺失值零L2，小匹配集按匹配数回退单线程。提供DISABLE_EQUALITY_POSTINGS，做完整JSON、单双线程、Unicode、高基数、多表、事务、重启、预算、ann、固定种子和sanitizer验证；三轮记录T/B/M、构建成本、扫描量、Recall，收益不足或资源代价不合理则撤销。写入conversation后等待选择，不自动做SIMD或ANN。"
+    },
+    {
+      "id": "ea-u21",
+      "origin": "earlier_attempt",
+      "source": "student",
+      "content": "下一阶段只做TopK单请求固定成本分解，基线d2ba60a热T=2.943s、无过滤3.412ms、过滤2.408ms，不修改执行逻辑，不重启SIMD/ANN/字典。学生分析：过滤扫描下降96.9%但耗时仅小幅下降，可能存在SQL/JSON解析、线程同步、序列化、flush或客户端传输等请求级固定成本；若不分解，继续索引或距离优化可能收益很小。设计点查、字典不存在、字典存在、无过滤四组，记录客户端/服务端/输出开始/flush/字节；在专门诊断构建聚合median/p95且不逐行计时。用相同持久请求序列比较Python与最小C++客户端，单双线程分解提交等待，必要时用K值、维度和只扫描到完整请求差分，不能把客户端成本误判数据库。只提交诊断脚本、计时和真实记录，回答固定成本比例、无过滤主因、客户端占比、下一单一模块及被推翻假设，写入conversation后等待选择。"
+    },
+    {
       "id": "u1",
       "source": "student",
-      "content": "完成 OceanBase 2026 数据库大赛赛题一 MiniVectorDB：先读题并仔细分析，参考官方题包实现完整代码，写好 Dockerfile，在本地与服务器上测试，注意官方服务器性能不如本地，测试指标不可照搬本地/云服务器结果，最后按题目要求把沟通记录保存为 conversation.json（评测默认读取 agent/conversation.json，≤128 KiB，UTF-8 合法 JSON）。"
+      "content": "完成 OceanBase 2026 数据库大赛赛题一 MiniVectorDB：先读题并仔细分析，参考官方题包实现完整代码，写好 Dockerfile，在本地与服务器上测试，注意官方服务器性能不如本地，测试指标不可照搬本地/云服务器结果，最后按题目要求把沟通记录保存为 conversation.json（评测默认读取 agent/conversation.json，≤128 KiB，UTF-8 合法 JSON）。",
+      "origin": "current"
     },
     {
       "id": "u2",
       "source": "student",
-      "content": "你需要从官方仓库获取基本代码，我的远端仓库有内容"
+      "content": "你需要从官方仓库获取基本代码，我的远端仓库有内容",
+      "origin": "current"
     },
     {
       "id": "u3",
       "source": "student",
-      "content": "原来的代码测试不通过，不需要借鉴"
+      "content": "原来的代码测试不通过，不需要借鉴",
+      "origin": "current"
     },
     {
       "id": "u4",
       "source": "student",
-      "content": "提测需要给出仓库 HTTPS URL、分支名 2026-competition-round2 和完整 40 位 commit SHA，源码、Dockerfile 和 conversation.json 必须来自同一次提交。"
+      "content": "提测需要给出仓库 HTTPS URL、分支名 2026-competition-round2 和完整 40 位 commit SHA，源码、Dockerfile 和 conversation.json 必须来自同一次提交。",
+      "origin": "current"
     },
     {
       "id": "u5",
       "source": "student",
-      "content": "上传到这个仓库 lyx88815313/seekdb-2026，沿用题目里规定的分支。"
+      "content": "上传到这个仓库 lyx88815313/seekdb-2026，沿用题目里规定的分支。",
+      "origin": "current"
     },
     {
       "id": "u6",
       "source": "student",
-      "content": "使用 github ci 测试一下刚刚你提交的代码。"
+      "content": "使用 github ci 测试一下刚刚你提交的代码。",
+      "origin": "current"
     },
     {
       "id": "u7",
       "source": "student",
-      "content": "按题目要求检查一下 D:/seekdb-notes/seekdb-round2-research 这里的代码。"
+      "content": "按题目要求检查一下 D:/seekdb-notes/seekdb-round2-research 这里的代码。",
+      "origin": "current"
     }
   ],
   "conversations": [
     {
+      "id": "ea-c1",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "采用统一追加日志作为事实来源、磁盘主键哈希目录、有界扫描、事务覆盖层和精确 TopK；ANN 与 SIMD 延后。协议层独立隔离，不猜测正式输出格式。"
+    },
+    {
+      "id": "ea-c2",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "WSL Ubuntu 24.04 的 g++ 13.3 首轮编译成功。Docker Desktop daemon 无法启动，因此没有声称 Dockerfile 镜像构建已验证。"
+    },
+    {
+      "id": "ea-c3",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "首轮端到端测试发现第一条 CREATE TABLE 提交后 fatal，重启会把合法日志截断为 0。gdb 定位到 Decoder 引用成员绑定临时 std::string 后形成悬垂引用。"
+    },
+    {
+      "id": "ea-c4",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "根据实际 gdb 证据将 Decoder 改为按值持有字符串，重新编译后悬垂引用相关警告消失，并委派同一测试执行者复测原场景。"
+    },
+    {
+      "id": "ea-c5",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "复测实际通过：赛题示例、多行 INSERT、过滤 TopK、并列主键排序、UPDATE/DELETE、事务读己之写、ROLLBACK、失败语句原子性、COMMIT 后重启、kill -9 未提交回滚、连续重启、Unicode 长度和非法向量输入。已提交行 1,2 在强杀未提交事务后保持，未提交 UPDATE 和 INSERT 未生效。"
+    },
+    {
+      "id": "ea-c6",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "外部排序阶段先复测并提交 495079a 核心基线。普通 ORDER BY 从同一事务可见记录流进入有界批次，临时段写入 /data/sort，以最多 32 路的堆合并；无排序查询和合并结果经 ResultWriter 逐行输出，TopK 保持 O(K)。"
+    },
+    {
+      "id": "ea-c7",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "专项测试首轮因参考行四列而查询投影三列失败，修正测试投影后原始套件通过。Release 全量核心回归通过；12,000 行、64 KiB 排序预算的峰值 RSS 为基线 16,332 KiB、外部排序版本 4,808 KiB。"
+    },
+    {
+      "id": "ea-c8",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "合入官方 a3dba55 公开用例后，新增只面向现有调试协议的 tests/run_public_cases.py；逐条映射官方 affected_rows、columns、rows、unordered 与浮点容差断言，不修改用例或猜测正式协议。"
+    },
+    {
+      "id": "ea-c9",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "公开用例实际结果：sql_crud 9、sql_comparisons 7、sql_ordering 7、sql_empty 4、vector_euclidean 5，共 32 条 SQL 全部通过。随后外部排序专项和核心 8 组回归再次全部通过。"
+    },
+    {
+      "id": "ea-c10",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "普通 merge 合入官方 9f6df2ba，逐行解释 SQL、--restart 和 --mode ann。restart 真实关闭并原目录重启；ann 状态保留在题包会话中并明确使用精确 TopK 回退。"
+    },
+    {
+      "id": "ea-c11",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "新版首次运行 20 个 case 均因 runner 的 select()+readline() 读前缓冲问题在首条 SELECT 后超时，统计仅 SQL=60、restart=5、ann=0、error=4。定位为 runner I/O 缺陷，数据库未改。"
+    },
+    {
+      "id": "ea-c12",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "runner 改为 bufsize=0 的二进制管道及 select+逐字节读取后，20/20 用例通过，TOTAL SQL=95 restart=7 ann=1 error=4 ann_sql=1。最终 Release 公开题包、外部排序和核心 8 组回归全部通过。"
+    },
+    {
+      "id": "ea-c13",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "针对学生提出的提交与恢复风险加入环境变量故障点，使用立即 _exit 模拟确定性进程消失；部分日志只写缺少 CRC 字节的记录，恢复目录在临时文件写入和安装前后中断。"
+    },
+    {
+      "id": "ea-c14",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "崩溃矩阵 10/10 通过：提交前和部分写入完整回滚；COMMIT 写后、同步后、目录应用后未响应均完整生效；已确认 COMMIT 强杀后保留；未请求提交强杀后回滚；两个恢复点各连续中断3次后无重复记录或重复 UPDATE/DELETE。首次恢复允许截断断尾，之后日志 SHA256 稳定。"
+    },
+    {
+      "id": "ea-c15",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "按官方 STDIO_PROTOCOL.md 实现严格 JSONL：恢复后 ready、execute/shutdown、布尔 ok、原样 id、类型化行和错误对象。输出值改为 int64/string/vector/double，JSON 查询数组逐行写出，外部排序临时格式同步保存类型。"
+    },
+    {
+      "id": "ea-c16",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "官方 protocol_check/run.py 的 handshake 与20个公开用例均一次通过，result.json passed=true 且 stderr 为空。自有 JSON 边界、公开用例、外部排序和10场景崩溃矩阵也全部通过。"
+    },
+    {
+      "id": "ea-c17",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "资源测试先确认 cgroup v2 权限。独立子 cgroup 创建被 PermissionError 拒绝，因此仅做明确标注的 RSS 预实验。测试采用正式 JSONL、流式行解析、独立生成器、流式摘要和 K 项 TopK 堆，不物化大结果。"
+    },
+    {
+      "id": "ea-c18",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "小规模首跑依次暴露客户端括号 depth、回滚参考主键和 EOF poll 竞态，均修复并重跑。N=6000/12000 全资源场景通过，采样 RSS 4852/4988 KiB；写入23.26/47.61s，外排14.28/29.25s，恢复22.39/45.75s，日志和段数约2倍。"
+    },
+    {
+      "id": "ea-c19",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "根据实测全表扫描瓶颈实现统一 scan_matching。主键等值候选由事务覆盖层优先、已提交哈希目录次之，取回后仍执行全部 AND；非主键路径不变。保留 DISABLE_PK_POINT 开关做完整响应差分。"
+    },
+    {
+      "id": "ea-c20",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "点查与关闭优化参考响应完全一致，事务/重启/故障矩阵通过。N=4000/8000 前→后中位数：SELECT 2320.16→1.01ms、4679.78→1.08ms；UPDATE 2640.54→9.27ms、5250.77→8.98ms；DELETE 2602.21→8.93ms、5305.03→8.53ms；RSS不变。"
+    },
+    {
+      "id": "ea-c21",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "Docker 首次构建因 ubuntu:24.04 registry 网络超时失败，使用镜像站同版本基础镜像后从源码构建成功。官方检查器 --image minivectordb:dev：握手与20/20公开用例通过，无超时/跳过，stderr为空，容器和卷均清理。核心未改；经赛题第4.4节复核后，材料已移至 agent/conversation.json。"
+    },
+    {
+      "id": "ea-c22",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "TopK 基线固定783a6eef，10,000行128维、1000查询、100条/批、三轮独立容器。写入T=2.814/2.814/2.695s，查询T=133.889/134.221/134.403s；每轮B=7340032写入+524288查询字节，M=10579968/10567680/10555392字节；两组Recall@10均为1。"
+    },
+    {
+      "id": "ea-c23",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "Profile 无过滤TopK约168ms、过滤TopK约101ms，与主负载平均134ms一致。代码确认每行重复解析查询向量且TopK重复算距离。候选仅为：语句级解析和距离复用；复用读取/解码缓冲并减少拷贝；之后评估保持精确语义的SIMD。等待学生选择，不实现ANN或checkpoint。"
+    },
+    {
+      "id": "ea-c24",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "按学生选择仅实现语句级解析与距离复用。PreparedQuery保存过滤字面量和向量，候选L2结果被排序与投影复用；浮点顺序、存储、日志、提交和恢复未改。测试构建计数编译期可选，Release为空操作。"
+    },
+    {
+      "id": "ea-c25",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "运行计数：无过滤解析1/L2=20，过滤解析1/L2=10/过滤10，点查解析1/L2=1，空集合解析1/L2=0；基线响应完全一致。三轮查询T前→后133.889→101.982、134.221→102.241、134.403→102.220s，B均524288字节不变，M基本持平，Recall=1。无过滤TopK约降36%，过滤仅3–4%，下一瓶颈转向记录读取/解码/过滤。"
+    },
+    {
+      "id": "ea-c26",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "按学生选择仅复用日志/行缓冲：LogRecord.payload跨记录复用，CRC分段计算免拼接，Row字符串/向量容量复用。TopK、事务和排序段仍持有稳定所有权，不保存复用缓冲视图。"
+    },
+    {
+      "id": "ea-c27",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "parse-reuse逐响应一致；ASan/UBSan/LSan点查、外排、崩溃和JSON零错误。三轮查询T=101.982→99.685、102.241→99.428、102.220→99.488s，本轮新增下降2.3/2.8/2.7%，B不变、M无回退、Recall=1。收益小但稳定且生命周期验证通过，因此保留。"
+    },
+    {
+      "id": "ea-c28",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "实现按表紧凑列式缓存和全局字节预算，仅非事务已提交查询使用；提交按表失效，失败/回滚不发布。超预算丢弃并负缓存，主键点查不变。冷构建与热查询分别采集T/B/M，大表回退和差分先行。"
+    },
+    {
+      "id": "ea-c29",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "缓存开关确定性及160步固定种子差分一致，sanitizer和10崩溃场景通过。超预算仅build_start=1/blocked=1，无重复构建；大表RSS/外排/恢复正常。三轮热查询T=99.950→7.841、99.594→7.872、99.806→7.995s，实际缓存9,028,542B，Recall=1，资源代价已记录。"
+    },
+    {
+      "id": "ea-c30",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "保序AVX2仅并行转换/差值/平方，lane结果按原顺序累加，无FMA或重归约。位级与JSON差分通过，但完整负载无收益；按学生标准撤销实现，仅保留实验记录。"
+    },
+    {
+      "id": "ea-c31",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "833个用例在Release和ASan/UBSan下double位模式一致，SQL标量/SIMD响应一致，实际命中AVX2。三轮热查询T相对缓存版7.872→8.002/7.936/7.953s，中位数7.953s约慢1%，无过滤/过滤均无稳定收益。B=0、M和Recall无回退；实现及专用测试文件已移除，源码恢复64be9141，撤销后回归通过。"
+    },
+    {
+      "id": "ea-c32",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "按准入优先原则先检查协议和未覆盖错误路径。公开用例、单TopK、恢复和原始Docker管道通过后，发现向量WHERE比较会在流式响应中嵌套错误，破坏JSON完整性。修复为输出前拒绝VECTOR比较，并让流式中途错误不再嵌套响应。"
+    },
+    {
+      "id": "ea-c33",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "最小复现显示错误对象被写进rows导致非法JSON，与timeout现象吻合。修复后SELECT/UPDATE/DELETE同类错误均返回完整错误对象，后续语句继续；新增专项、官方20用例、10崩溃场景、外排、JSON、缓存和公开回归全部通过。正式同一用例仍需重新提测确认。"
+    },
+    {
+      "id": "ea-c34",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "实现持久双线程池，仅缓存命中的非事务非主键TopK启用。worker独立行解码/WHERE/double L2/K堆，主线程等待合并；关闭join，点查与其他路径不变。"
+    },
+    {
+      "id": "ea-c35",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "单双线程完整JSON一致，固定种子160步一致；TSan（关闭ASLR）和ASan/UBSan/LSan无错误。2 CPU三轮热查询T=8.095→5.626s，新增下降30.5%，无过滤TopK降36%、过滤降15%，B=0、M无回退、Recall=1，CPU仅增约2–4%。"
+    },
+    {
+      "id": "ea-c36",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "实现语句级PreparedEquality，仅非主键单条件BIGINT/VARCHAR等值在缓存TopK特化。直接比较缓存列，VARCHAR用string_view，不匹配不解码Row/不算L2；通用路径和事务不变。"
+    },
+    {
+      "id": "ea-c37",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "特化/通用单双线程响应一致，固定种子和sanitizer通过。三轮热T=5.491/5.429/5.441s，对基线5.626s中位数降3.3%；过滤TopK中位数3.18→2.83ms降10.9%，B=0、M无回退、Recall=1。实际特化求值5,050,000次、匹配157,810次。"
+    },
+    {
+      "id": "ea-c38",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "只读审计确认16MiB为所有表共享预算，临时构建超限释放、失效扣除总量、负缓存仅按表记录；查询shared_ptr持有缓存且pool.run等待worker完成，未发现需先修复的增长或生命周期问题。物化审计发现无过滤每行、过滤每匹配行仍构造完整Row和OutputRow。按学生预测仅增加缓存直读L2和24字节轻量候选，最终K行才从缓存解码投影；保留DISABLE_LAZY_TOPK原路径，不改距离、缓存布局或其他执行路径。"
+    },
+    {
+      "id": "ea-c39",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "新旧完整JSON在单双线程、投影、事务、ann、大表和160步序列一致；ASan/UBSan/LSan与TSan零相关报告。小型计数旧→新：Row 30→6、缓存字段120→24、投影值60→12，L2均30；候选平均160→24字节。三轮lazy热T=3.098/3.065/3.033s，中位数相对b637的5.441s降43.7%；同二进制开关5.440→3.065s，无过滤TopK 7.601→3.763ms、过滤2.768→2.704ms。热B增量均0，完整窗口B均6,340,608B，M 17.555→17.730MiB，Recall=1；冷首查询单次0.1126→0.0712s。官方Docker20、10崩溃和全部回归通过，Release零新增警告。收益满足保留标准；缓存向量本已连续，不建议立即扩大为完整SoA或字典编码。"
+    },
+    {
+      "id": "ea-c40",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "按学生预测仅增加缓存内派生postings：最多64个VARCHAR值，字典bucket/节点/字符串容量和行号容量计入全局预算，超基数或预算只放弃索引。查询准备后查字典，缺失值使用空postings；按匹配数分派worker，无过滤仍走原scan_range。未改距离、候选、日志、事务或大表路径。"
+    },
+    {
+      "id": "ea-c41",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "开关完整响应、重启、ann、高基数、预算和160步差分通过，ASan/UBSan/LSan/TSan零报告。benchmark过滤扫描5,050,000→157,810，匹配157,810不变；2行小匹配集扫描2行且不建线程池，缺失值L2/Row均0。三轮ON T=2.943/2.925/2.982s，中位数2.943s，相对3.065s降4.0%；同二进制OFF→ON中位2.984→2.943s。过滤2.579→2.408ms，无过滤3.393→3.412ms属噪声。32值/10000行postings=68,872B，构建含高基数检查约1.1ms；同二进制M=18,333,696→18,407,424B，增量68,872B，热B=0、完整B均6,340,608B、Recall=1。冷首查询单次0.072→0.074s。官方20、10崩溃及全部回归通过，保留；等待学生决定后续，不自动做SIMD/ANN。"
+    },
+    {
+      "id": "ea-c42",
+      "origin": "earlier_attempt",
+      "source": "agent",
+      "content": "仅加入默认OFF的阶段计时与两种持久客户端，不改变执行逻辑。按请求标记聚合median/p95和响应字节，request_total排除getline等待客户端；worker_wait与scan重叠、worker_scan为双worker合计，禁止直接相加。使用K=1/10/100和1/128维差分区分堆、物化输出与L2。初测发现诊断计数streambuf退出生命周期和客户端头文件问题，RAII修复后30次退出零崩溃，普通Release无诊断输出。"
+    },
+    {
+      "id": "ea-c43",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "content": "每组500次、双线程诊断：point/absent/filtered/unfiltered服务端total中位/p95=0.4690/0.6490、0.0532/0.0650、0.1216/0.1617、0.9127/1.0208ms；Python T=0.6791/0.8829、0.3948/0.4672、1.1001/1.2439、1.8958/2.1033ms，C++ T=0.4953/0.6587、0.1964/0.2259、0.2712/0.3172、1.0459/1.1628ms。absent扫描/L2/物化均0，推翻约2ms固定成本猜想；固定成本占filtered服务端35.3–43.8%但仅0.04–0.05ms，且小匹配集单双线程均无worker提交。unfiltered扫描0.8410ms约占92%，t1→t2总时间1.4916→0.9127ms；1→128维总差0.702ms中扫描差0.677ms，主因是L2而非线程/输出。K10→100物化+0.079ms、输出+0.032ms。C++客户端差约0.01–0.15ms；Python无过滤/过滤开销约51.8%/89.0%，K100约84%，属于驱动成本。下一优先仅无过滤缓存L2扫描内核，不自动SIMD/ANN。默认Release官方20、10崩溃和全部回归通过。"
+    },
+    {
       "id": "c1",
       "source": "student",
-      "content": "读题阶段先确认了三件事：提交物必须同属一次 commit；功能准入是一票否决（MySQL case 全通过才有性能分与 Agent prompt 分）；协议是 JSON Lines 而不是 MySQL 网络协议。这些约束决定了后面所有工作的顺序。"
+      "content": "读题阶段先确认了三件事：提交物必须同属一次 commit；功能准入是一票否决（MySQL case 全通过才有性能分与 Agent prompt 分）；协议是 JSON Lines 而不是 MySQL 网络协议。这些约束决定了后面所有工作的顺序。",
+      "origin": "current"
     },
     {
       "id": "c2",
       "source": "agent",
-      "content": "题包分支只有 102 项：空 Dockerfile、空 conversation.json、STDIO_PROTOCOL.md、mysqltest/（20 个公开用例）和 protocol_check/（run.py、_transport.py、_assertions.py、config.json）。因此基线代码必须自己写，题包只提供协议与断言。"
+      "content": "题包分支只有 102 项：空 Dockerfile、空 conversation.json、STDIO_PROTOCOL.md、mysqltest/（20 个公开用例）和 protocol_check/（run.py、_transport.py、_assertions.py、config.json）。因此基线代码必须自己写，题包只提供协议与断言。",
+      "origin": "current"
     },
     {
       "id": "c3",
       "source": "student",
-      "content": "基线必须取自官方仓库，不能沿用本地原有的实现。"
+      "content": "基线必须取自官方仓库，不能沿用本地原有的实现。",
+      "origin": "current"
     },
     {
       "id": "c4",
       "source": "agent",
-      "content": "按此执行：git clone --depth 1 --single-branch --branch 2026-competition-round2 https://github.com/oceanbase/seekdb.git，基线 HEAD 为 f4d4e26653af823a7601668802f80e374ad6643c；本地原有的 minivectordb 目录与旧镜像全部弃用，未参考其代码。"
+      "content": "按此执行：git clone --depth 1 --single-branch --branch 2026-competition-round2 https://github.com/oceanbase/seekdb.git，基线 HEAD 为 f4d4e26653af823a7601668802f80e374ad6643c；本地原有的 minivectordb 目录与旧镜像全部弃用，未参考其代码。",
+      "origin": "current"
     },
     {
       "id": "c5",
       "source": "student",
-      "content": "正式运行环境是 Linux x86_64 容器、禁网，依赖必须在构建阶段装好并锁版本，提交物不能只 COPY 本地预编译二进制。"
+      "content": "正式运行环境是 Linux x86_64 容器、禁网，依赖必须在构建阶段装好并锁版本，提交物不能只 COPY 本地预编译二进制。",
+      "origin": "current"
     },
     {
       "id": "c6",
       "source": "agent",
-      "content": "因此 Dockerfile 采用两阶段构建：builder 阶段按 digest 固定 ubuntu:24.04 并安装锁定版本的 g++-13，从 minivectordb/ 源码现场编译；运行阶段只 COPY 编译产物，运行期不需要网络也不链接任何第三方库。"
+      "content": "因此 Dockerfile 采用两阶段构建：builder 阶段按 digest 固定 ubuntu:24.04 并安装锁定版本的 g++-13，从 minivectordb/ 源码现场编译；运行阶段只 COPY 编译产物，运行期不需要网络也不链接任何第三方库。",
+      "origin": "current"
     },
     {
       "id": "c7",
       "source": "agent",
-      "content": "Windows 上直接跑 protocol_check/run.py 报 [WinError 10093] WSAStartup 失败。原因是 _transport.py 用 selectors 监听 subprocess 的管道，而 Windows 的 SelectSelector 只支持套接字，所以官方驱动在 Windows 上不可能跑通。解决办法是让官方驱动在 Linux 里原样运行，而不是改写题包：准备一个带 docker CLI 的 Linux 辅助镜像，把宿主机 /var/run/docker.sock 转发进去，run.py 的 --image 路径完全不变，仍然是真实容器启动。"
+      "content": "Windows 上直接跑 protocol_check/run.py 报 [WinError 10093] WSAStartup 失败。原因是 _transport.py 用 selectors 监听 subprocess 的管道，而 Windows 的 SelectSelector 只支持套接字，所以官方驱动在 Windows 上不可能跑通。解决办法是让官方驱动在 Linux 里原样运行，而不是改写题包：准备一个带 docker CLI 的 Linux 辅助镜像，把宿主机 /var/run/docker.sock 转发进去，run.py 的 --image 路径完全不变，仍然是真实容器启动。",
+      "origin": "current"
     },
     {
       "id": "c8",
       "source": "agent",
-      "content": "第一轮真实运行暴露出协议层的 id 回显缺陷：响应是 {\"id\":null1,\"ok\":true}。定位到 main.cpp 里 id_text 先被赋成字符串 \"null\"，随后 write_json_value 又向同一个字符串追加内容，于是整数 id 变成 null1。修正为默认空串、只有请求里确实没有 id 时才回退成 null。"
+      "content": "第一轮真实运行暴露出协议层的 id 回显缺陷：响应是 {\"id\":null1,\"ok\":true}。定位到 main.cpp 里 id_text 先被赋成字符串 \"null\"，随后 write_json_value 又向同一个字符串追加内容，于是整数 id 变成 null1。修正为默认空串、只有请求里确实没有 id 时才回退成 null。",
+      "origin": "current"
     },
     {
       "id": "c9",
       "source": "agent",
-      "content": "第二轮 12/20 通过，剩余失败全部报 type_mismatch: column def expects a string。catalog 表自己有一列叫 def（VARCHAR），说明是写目录时类型对不上。查 write_catalog_entry 发现它把整行两个值 {int(id), text(def)} 传给了 update_rows，但 update_rows 的约定是 values 与 columns 平行，columns={1} 时只取 values[0]，于是整数 id 被写进了 VARCHAR 的 def 列。改为只传 def 一列的值。"
+      "content": "第二轮 12/20 通过，剩余失败全部报 type_mismatch: column def expects a string。catalog 表自己有一列叫 def（VARCHAR），说明是写目录时类型对不上。查 write_catalog_entry 发现它把整行两个值 {int(id), text(def)} 传给了 update_rows，但 update_rows 的约定是 values 与 columns 平行，columns={1} 时只取 values[0]，于是整数 id 被写进了 VARCHAR 的 def 列。改为只传 def 一列的值。",
+      "origin": "current"
     },
     {
       "id": "c10",
       "source": "agent",
-      "content": "第三轮 16/20 通过，剩下全是 table_not_found，且都出现在 --restart 之后。逐个排查出四个独立的恢复缺陷：其一，Storage::page_count 对「文件在磁盘上存在但本进程未打开」的情况返回 0，导致目录扫描不到任何页；其二，load_catalog 用 find_by_pk 取行，可此时目录表的主键索引还没建立，查找必然失败，于是表定义被整段跳过；其三，apply_page_alloc 只把 64 字节页头写回文件，文件长度没有扩展到整页，page_count 仍然算出 0；其四，build_vector_index 把指向页内的裸指针带出扫描，扫描翻页时页已被释放。"
+      "content": "第三轮 16/20 通过，剩下全是 table_not_found，且都出现在 --restart 之后。逐个排查出四个独立的恢复缺陷：其一，Storage::page_count 对「文件在磁盘上存在但本进程未打开」的情况返回 0，导致目录扫描不到任何页；其二，load_catalog 用 find_by_pk 取行，可此时目录表的主键索引还没建立，查找必然失败，于是表定义被整段跳过；其三，apply_page_alloc 只把 64 字节页头写回文件，文件长度没有扩展到整页，page_count 仍然算出 0；其四，build_vector_index 把指向页内的裸指针带出扫描，扫描翻页时页已被释放。",
+      "origin": "current"
     },
     {
       "id": "c11",
       "source": "agent",
-      "content": "崩溃恢复仍然失败：SIGKILL 之后已确认提交的表不见了。把 wal.log 的字节按记录格式手工解码后发现，重做记录的载荷里开头并不是 table_id，而是页头魔数 'MVDB'。根因在 write_records：它对 payload 只调用了 reserve 而不是 resize，随后的 insert 把记录头覆盖掉了，于是重放时 table_id/page_id/区间表全部错位，页面修改从来没有被真正重放。改成先 resize 出记录头再追加区间内容，并顺手把 WAL 头部的 4 字节空洞清零。"
+      "content": "崩溃恢复仍然失败：SIGKILL 之后已确认提交的表不见了。把 wal.log 的字节按记录格式手工解码后发现，重做记录的载荷里开头并不是 table_id，而是页头魔数 'MVDB'。根因在 write_records：它对 payload 只调用了 reserve 而不是 resize，随后的 insert 把记录头覆盖掉了，于是重放时 table_id/page_id/区间表全部错位，页面修改从来没有被真正重放。改成先 resize 出记录头再追加区间内容，并顺手把 WAL 头部的 4 字节空洞清零。",
+      "origin": "current"
     },
     {
       "id": "c12",
       "source": "student",
-      "content": "官方服务器性能不如本地，测试指标不能照搬本地或云服务器的结果。"
+      "content": "官方服务器性能不如本地，测试指标不能照搬本地或云服务器的结果。",
+      "origin": "current"
     },
     {
       "id": "c13",
       "source": "agent",
-      "content": "因此所有本地数字都标注为「本地测量，非官方平台结果」，并在远端 Linux 服务器上重新测量一遍作为对照。"
+      "content": "因此所有本地数字都标注为「本地测量，非官方平台结果」，并在远端 Linux 服务器上重新测量一遍作为对照。",
+      "origin": "current"
     },
     {
       "id": "c14",
       "source": "agent",
-      "content": "目标仓库 lyx88815313/seekdb-2026 的 2026-competition-round2 分支上原本就存在另一份 MiniVectorDB 实现（tip 9f0508d2，根目录 src/ 与 tests/ 布局，还带了一个根目录 CMakeLists.txt）。两份实现目录结构不同、无法合并——合并会让提交物里同时留下两套实现，评测方无从判断用哪一套。因此先把旧 tip 备份到远端分支 backup/2026-competition-round2-pre-submission，再用 --force-with-lease 把本次提交覆盖到题目规定的分支，这样旧内容可随时取回而提交物保持唯一。覆盖后核对：相对官方基线 f4d4e2665 只有新增与修改，官方文件零删除。"
+      "content": "目标仓库 lyx88815313/seekdb-2026 的 2026-competition-round2 分支上原本就存在另一份 MiniVectorDB 实现（tip 9f0508d2，根目录 src/ 与 tests/ 布局，还带了一个根目录 CMakeLists.txt）。两份实现目录结构不同、无法合并——合并会让提交物里同时留下两套实现，评测方无从判断用哪一套。因此先把旧 tip 备份到远端分支 backup/2026-competition-round2-pre-submission，再用 --force-with-lease 把本次提交覆盖到题目规定的分支，这样旧内容可随时取回而提交物保持唯一。覆盖后核对：相对官方基线 f4d4e2665 只有新增与修改，官方文件零删除。",
+      "origin": "current"
     },
     {
       "id": "c15",
       "source": "agent",
-      "content": "推送前先核实目标仓库的真实状态：用匿名 GitHub API 查询 repos/lyx88815313/seekdb-2026 返回 404，而公开的 seekdb-fork 返回 200，说明目标仓库是私有的，评测方需要被授权或把它改为公开。推送时本机 git 直连 github.com 连续失败，排查后发现 DNS 把 github.com 解析到了 57.155.223.240 这个不可达地址，而 GitHub 的真实地址是通的、本机还配置了 127.0.0.1:7897 的系统代理；把 http.proxy 设成仓库级配置后推送即成功。提交后用 git ls-remote 与 GitHub API 两条独立通道核对远端 SHA，得到同一个 40 位值。"
+      "content": "推送前先核实目标仓库的真实状态：用匿名 GitHub API 查询 repos/lyx88815313/seekdb-2026 返回 404，而公开的 seekdb-fork 返回 200，说明目标仓库是私有的，评测方需要被授权或把它改为公开。推送时本机 git 直连 github.com 连续失败，排查后发现 DNS 把 github.com 解析到了一个被阻断的地址，而 GitHub 的真实地址是通的、本机还配置了回环地址上的系统代理；把 http.proxy 设成仓库级配置后推送即成功。提交后用 git ls-remote 与 GitHub API 两条独立通道核对远端 SHA，得到同一个 40 位值。",
+      "origin": "current"
     },
     {
       "id": "c16",
       "source": "agent",
-      "content": "为了让提交物能被第三方环境复测，在仓库里新增 .github/workflows/minivectordb-ci.yml：先用 docker build --pull 从源码构建镜像，再跑题包自带的 protocol_check/run.py（--image 指向刚构建的镜像），随后跑崩溃恢复自测、编译零警告检查与提交物合规检查。为了不让 CI 第一次运行就因为 YAML 缩进或 heredoc 失败，先在本地 Linux 容器里把每个 run 脚本抽出来逐个执行，并对合规检查做了一次反向验证（故意写坏 agent/conversation.json，确认它会失败）。"
+      "content": "为了让提交物能被第三方环境复测，在仓库里新增 .github/workflows/minivectordb-ci.yml：先用 docker build --pull 从源码构建镜像，再跑题包自带的 protocol_check/run.py（--image 指向刚构建的镜像），随后跑崩溃恢复自测、编译零警告检查与提交物合规检查。为了不让 CI 第一次运行就因为 YAML 缩进或 heredoc 失败，先在本地 Linux 容器里把每个 run 脚本抽出来逐个执行，并对合规检查做了一次反向验证（故意写坏 agent/conversation.json，确认它会失败）。",
+      "origin": "current"
     },
     {
       "id": "c17",
       "source": "agent",
-      "content": "按用户要求复查旧实现目录时，我没有只读代码，而是把旧实现与本次提交放在同一台机器上跑同一组探针，用的都是题包自带的官方驱动。旧实现公开用例 20/20 通过，我另外写的 29 条要求探针也全部通过：VARCHAR 按码点计长（8 个汉字接受、9 个拒绝）、字符串按码点序比较（含 U+1F600 与 U+FFFD）、向量拒绝 NaN/Infinity/维度不符/float32 溢出、L2_DISTANCE 是真实欧氏距离而非平方距离、距离并列按主键升序、过滤后 TopK 在过滤集合内计算（ann 与 exact 一致）、事务内读己之写与 ROLLBACK、id 为字符串或超 JS 安全整数时原样回传。同题对比同时暴露了我这次提交自己的两处缺陷，于是当场修掉了。"
+      "content": "按用户要求复查旧实现目录时，我没有只读代码，而是把旧实现与本次提交放在同一台机器上跑同一组探针，用的都是题包自带的官方驱动。旧实现公开用例 20/20 通过，我另外写的 29 条要求探针也全部通过：VARCHAR 按码点计长（8 个汉字接受、9 个拒绝）、字符串按码点序比较（含 U+1F600 与 U+FFFD）、向量拒绝 NaN/Infinity/维度不符/float32 溢出、L2_DISTANCE 是真实欧氏距离而非平方距离、距离并列按主键升序、过滤后 TopK 在过滤集合内计算（ann 与 exact 一致）、事务内读己之写与 ROLLBACK、id 为字符串或超 JS 安全整数时原样回传。同题对比同时暴露了我这次提交自己的两处缺陷，于是当场修掉了。",
+      "origin": "current"
     },
     {
       "id": "c18",
       "source": "agent",
-      "content": "旧实现 README 里记着一条比代码本身更重要的教训：它连续 4 次正式提交（3aa6167/64be914/b637f01/d2ba60a）都被平台判为「失败用例数 1：JSON response timeout」，用 ASan 定位并修掉 ORDER BY 普通列加 L2_DISTANCE 投影的确定性 SIGSEGV 之后，第 5 次提交仍然报同样的错，原因始终没有确认，README 的结论是「最可能是某个隐藏用例的语义分歧（错误码词汇、边界行为），需要平台完整判题日志才能定位」。我也复现了这个风险面：旧实现把 value_too_long、type_mismatch、table_not_found、column_not_found、invalid_vector，以及 JOIN、聚合、子查询、外键、主键更新、嵌套事务等几乎所有失败情形都收敛成同一个 sql_error。公开题包的 config 里 error_codes 是空对象、只校验错误码非空，所以本地一律通过；一旦隐藏题包冻结了错误码映射，这一大片就会一起失分。这条直接印证了「公开用例全绿不等于可以提测」。"
+      "content": "旧实现 README 里记着一条比代码本身更重要的教训：它连续 4 次正式提交（3aa6167/64be914/b637f01/d2ba60a）都被平台判为「失败用例数 1：JSON response timeout」，用 ASan 定位并修掉 ORDER BY 普通列加 L2_DISTANCE 投影的确定性 SIGSEGV 之后，第 5 次提交仍然报同样的错，原因始终没有确认，README 的结论是「最可能是某个隐藏用例的语义分歧（错误码词汇、边界行为），需要平台完整判题日志才能定位」。我也复现了这个风险面：旧实现把 value_too_long、type_mismatch、table_not_found、column_not_found、invalid_vector，以及 JOIN、聚合、子查询、外键、主键更新、嵌套事务等几乎所有失败情形都收敛成同一个 sql_error。公开题包的 config 里 error_codes 是空对象、只校验错误码非空，所以本地一律通过；一旦隐藏题包冻结了错误码映射，这一大片就会一起失分。这条直接印证了「公开用例全绿不等于可以提测」。",
+      "origin": "current"
     }
   ],
   "experiments": [
+    {
+      "id": "ea-e1",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 1：对 docs 的 database 过滤后执行 …",
+      "status": "executed",
+      "action": "对 docs 的 database 过滤后执行 L2_DISTANCE TopK，K=2。",
+      "output": "返回 id=1 distance=0.141421374149721，id=2 distance=1.272792188223375；travel 行被过滤。"
+    },
+    {
+      "id": "ea-e2",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 2：在 BEGIN 后修改向量、删除记录和插入记录，…",
+      "status": "executed",
+      "action": "在 BEGIN 后修改向量、删除记录和插入记录，再执行普通 SELECT 与 TopK，最后 ROLLBACK。",
+      "output": "事务内普通查询和 TopK 均看到修改；回滚后原始三行、原始向量及 TopK 顺序恢复。"
+    },
+    {
+      "id": "ea-e3",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 3：在多行 INSERT 中分别制造批内重复主键、已…",
+      "status": "executed",
+      "action": "在多行 INSERT 中分别制造批内重复主键、已提交主键冲突、事务内主键冲突和向量维度错误。",
+      "output": "四类语句均返回 ERROR，未留下任何部分行；显式事务随后仍可 COMMIT，之前成功的记录保留。"
+    },
+    {
+      "id": "ea-e4",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 4：用 256 字节排序阈值处理 800 行，对照独…",
+      "status": "executed",
+      "action": "用 256 字节排序阈值处理 800 行，对照独立 Python 全量排序；覆盖 ASC/DESC、LIMIT、Unicode、BIGINT、事务、回滚和排序途中 kill -9。随后比较 12,000 行负载在基线与外部排序版本的峰值 RSS。",
+      "output": "所有逐行比较和恢复断言通过；临时 sort 文件清理。/usr/bin/time -v 报告基线 16,332 KiB、外部排序版本 4,808 KiB，结果均为 12,000 行。"
+    },
+    {
+      "id": "ea-e5",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 5：对合入的每个官方公开 case 使用独立空数据目…",
+      "status": "executed",
+      "action": "对合入的每个官方公开 case 使用独立空数据目录，通过本地调试协议执行 SQL 并逐条比较官方 JSON 断言。",
+      "output": "PASS sql_crud 9、sql_comparisons 7、sql_ordering 7、sql_empty 4、vector_euclidean 5；PASS public cases 5 cases。"
+    },
+    {
+      "id": "ea-e6",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 6：新版题包首次全量运行后修复 runner 的管道…",
+      "status": "executed",
+      "action": "新版题包首次全量运行后修复 runner 的管道缓冲，再重新执行全部 20 个 case 和既有回归。",
+      "output": "首次仅推进 SQL=60；修复后 TOTAL cases=20 SQL=95 restart=7 ann=1 error=4 ann_sql=1，外部排序、事务、强杀恢复、TopK 和输入校验全部通过。"
+    },
+    {
+      "id": "ea-e7",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 7：在 COMMIT 前、ROW/COMMIT 部分…",
+      "status": "executed",
+      "action": "在 COMMIT 前、ROW/COMMIT 部分写入、COMMIT 写后/同步后/目录应用后未响应、确认提交后强杀、未请求提交强杀、恢复行应用和目录安装点分别确定性退出。",
+      "output": "10/10 场景符合完整旧状态或完整新状态约束；重复恢复行集不变，首次恢复后日志摘要稳定，无临时文件残留。随后公开20用例、外部排序及核心回归全部通过。"
+    },
+    {
+      "id": "ea-e8",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 8：使用官方 protocol_check/run.…",
+      "status": "executed",
+      "action": "使用官方 protocol_check/run.py 验证 ready/shutdown 和全部公开用例，并执行字符串/布尔 id、大整数、向量类型、分号、错误继续、外部排序和崩溃矩阵。",
+      "output": "官方 handshake passed=true，20个公开用例 passed=true；自有协议测试 TOTAL SQL=95 restart=7 ann=1 error=4，外部排序及10个崩溃场景全部通过。"
+    },
+    {
+      "id": "ea-e9",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 9：以6000和12000行、512字节 VARCH…",
+      "status": "executed",
+      "action": "以6000和12000行、512字节 VARCHAR、32维向量、64KiB 排序预算运行写入、流式查询、外排、TopK、事务、重启、强杀和重复恢复。",
+      "output": "两例全部正确；采样RSS基本恒定，耗时/日志/段数约2倍。瓶颈证据指向单条变更全表扫描和WSL同步I/O。官方20用例、10崩溃场景和其余回归全部通过。"
+    },
+    {
+      "id": "ea-e10",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 10：对4000/8000行使用相同确定性数据、分散主…",
+      "status": "executed",
+      "action": "对4000/8000行使用相同确定性数据、分散主键和3轮测量，对比优化前后 SELECT/UPDATE/DELETE；UPDATE/DELETE 每例使用独立目录副本。",
+      "output": "优化后 N/2N 分别为 SELECT 1.07x、UPDATE 0.97x、DELETE 0.96x，摆脱全表线性依赖；采样RSS约4.2–4.4MiB不变。差分、崩溃、官方和外部排序回归全部通过。"
+    },
+    {
+      "id": "ea-e11",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 11：固定783a6eef基线，以10,000行128…",
+      "status": "executed",
+      "action": "固定783a6eef基线，以10,000行128维、1000条TopK运行三轮，独立C++暴力参考逐查询核对，采集容器io.stat和memory.peak。",
+      "output": "三轮查询T=133.889/134.221/134.403s，Recall均为1；profile显示无过滤TopK约168ms、过滤约101ms，证明记录与距离路径均有成本。未修改基线实现。"
+    },
+    {
+      "id": "ea-e12",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 12：实现语句级解析和距离复用后，以同一10,000×…",
+      "status": "executed",
+      "action": "实现语句级解析和距离复用后，以同一10,000×128、1000查询负载跑三轮，并做基线响应差分和编译期可选计数。",
+      "output": "查询T中位数134.221→102.220s，B不变、M基本持平、Recall=1；每语句向量解析1次，过滤行不算L2，输出不重算。全部官方、崩溃、排序和点查回归通过。"
+    },
+    {
+      "id": "ea-e13",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 13：复用日志和行解码缓冲，保持TopK/排序段所有权…",
+      "status": "executed",
+      "action": "复用日志和行解码缓冲，保持TopK/排序段所有权，执行parse-reuse差分、ASan/UBSan和三轮同负载实验。",
+      "output": "查询T中位数102.220→99.488s，本轮新增约2.7%，B不变、M无回退、Recall=1；sanitizer无相关错误，所有回归通过。收益小但稳定且安全，保留实现。"
+    },
+    {
+      "id": "ea-e14",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 14：实现16MiB有界列式缓存，做开关差分、160步…",
+      "status": "executed",
+      "action": "实现16MiB有界列式缓存，做开关差分、160步固定种子序列、超预算负缓存、大表回退和冷/热三轮TopK对照。",
+      "output": "热查询T中位数99.594→7.872s，Recall=1；实际缓存9,028,542B，M增加约6.3MiB，冷构建T约0.112s。正确性、sanitizer、大表回退和全部回归通过，满足保留标准。"
+    },
+    {
+      "id": "ea-e15",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 15：实现保序AVX2并做位级、SQL、sanitiz…",
+      "status": "executed",
+      "action": "实现保序AVX2并做位级、SQL、sanitizer和完整三轮对照；收益不达标时撤销。",
+      "output": "833例位级相等且JSON差分通过，但热查询T中位数7.872→7.953s，约慢1%。已撤销实现并恢复64be9141，所有撤销后回归通过，仅保留实验证据。"
+    },
+    {
+      "id": "ea-e16",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 16：对WHERE embedding='[0,0]'…",
+      "status": "executed",
+      "action": "对WHERE embedding='[0,0]'执行SELECT/UPDATE/DELETE，观察流式响应并验证修复。",
+      "output": "修复前错误对象嵌套在rows形成非法JSON；修复后返回incomparable value types，后续语句正常，shutdown成功。官方检查与全部回归通过。"
+    },
+    {
+      "id": "ea-e17",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 17：以持久双线程池并行缓存TopK，做1/2线程差分…",
+      "status": "executed",
+      "action": "以持久双线程池并行缓存TopK，做1/2线程差分、固定种子序列、TSan/ASan和2 CPU三轮性能对照。",
+      "output": "2线程热查询T中位数8.095→5.626s，新增下降30.5%，B=0、M无回退、Recall=1；完整响应一致且sanitizer无错误。官方及全部回归通过，保留实现。"
+    },
+    {
+      "id": "ea-e18",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 18：特化缓存TopK单列VARCHAR/BIGINT…",
+      "status": "executed",
+      "action": "特化缓存TopK单列VARCHAR/BIGINT等值过滤，做通用开关差分、固定种子、TSan/ASan及三轮双线程对照。",
+      "output": "热T中位数5.626→5.441s，过滤TopK 3.18→2.83ms，B/M/Recall无回退；实际特化求值5,050,000次。所有差分和回归通过，保留实现。"
+    },
+    {
+      "id": "ea-e19",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 19：对缓存TopK实现最终K行延迟物化，以编译期可选…",
+      "status": "executed",
+      "action": "对缓存TopK实现最终K行延迟物化，以编译期可选计数核对物化，使用开关做完整响应差分和sanitizer，并在2 CPU容器对10000×128、1000查询分别跑三轮及同二进制A/B。",
+      "output": "Row构造30→6、候选160→24字节而L2次数不变。三轮T=3.098/3.065/3.033s，中位数3.065s，相对5.441s降43.7%；同二进制完整B均6,340,608B，M 17.555→17.730MiB，Recall=1。冷首查询单次0.1126→0.0712s；所有正确性、线程/内存安全、官方20和10崩溃回归通过，保留实现并等待下一选择。"
+    },
+    {
+      "id": "ea-e20",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 20：为低基数VARCHAR缓存列建立值到uint32…",
+      "status": "executed",
+      "action": "为低基数VARCHAR缓存列建立值到uint32行号postings，做开关完整响应、预算/高基数/小匹配集/缺失值、固定种子和sanitizer验证，并运行三轮10000×128、1000 TopK及冷缓存对照。",
+      "output": "扫描5,050,000→157,810行，索引68,872B、约1.1ms，同二进制M增加68,872B。三轮T=2.943/2.925/2.982s，中位数2.943s，相对3.065s降4.0%；过滤2.579→2.408ms，无过滤变化在噪声内，完整B不变、Recall=1。缺失值零L2，小匹配集单线程；所有官方、崩溃、差分和sanitizer通过，保留实现。"
+    },
+    {
+      "id": "ea-e21",
+      "origin": "earlier_attempt",
+      "source": "tool",
+      "title": "早期方案实验 21：仅使用诊断插桩和Python/C++持久客户端，…",
+      "status": "executed",
+      "action": "仅使用诊断插桩和Python/C++持久客户端，对点查、缺失字典、过滤和无过滤TopK各测500次，单双线程分解并用K1/K10/K100和1/128维做差分；普通Release独立复测。",
+      "output": "absent服务端0.0532ms且零扫描，filtered固定成本35.3–43.8%但绝对值仅0.04–0.05ms；unfiltered扫描0.8410ms约占92%，维度差证明L2主导。Python轻查询及K100客户端成本显著，C++差仅0.01–0.15ms。响应字节两客户端与Release一致；下一候选仅无过滤L2扫描内核，未修改执行逻辑。"
+    },
     {
       "id": "e1",
       "title": "官方协议检查在 Windows 上无法运行",
@@ -141,7 +745,8 @@
       "action": "阅读题包 _transport.py，确认它用 selectors.DefaultSelector 监听 subprocess.PIPE；同时准备一个带 docker CLI 的 Linux 辅助镜像并转发宿主机 docker socket。",
       "output": "Windows 直跑：[WinError 10093] WSAStartup 失败；Linux 辅助镜像内跑官方 run.py --image minivectordb:local，握手成功并能逐条返回用例结果。",
       "interpretation": "Windows 的 SelectSelector 只能监听套接字，监听管道必然失败，所以题包驱动只能在 Linux 上运行。之后所有功能验证都在 Linux 里用未经修改的官方脚本进行。",
-      "verification": "官方 run.py 的 20 个公开用例全部 PASS，报告写到 protocol-results/。"
+      "verification": "官方 run.py 的 20 个公开用例全部 PASS，报告写到 protocol-results/。",
+      "origin": "current"
     },
     {
       "id": "e2",
@@ -151,7 +756,8 @@
       "action": "读 main.cpp 的 id 处理逻辑，确认 id_text 预置为 null 后 write_json_value 继续向同一缓冲区追加。",
       "output": "修复前：{\"id\":null1,\"ok\":true}；修复后：{\"id\":1,\"ok\":true}。",
       "interpretation": "协议要求 id 原样回传且保持 JSON 类型，默认值与序列化输出必须分开，否则数字 id 会被拼成非法 JSON。",
-      "verification": "官方 run.py 握手检查通过，全部用例能继续执行。"
+      "verification": "官方 run.py 握手检查通过，全部用例能继续执行。",
+      "origin": "current"
     },
     {
       "id": "e3",
@@ -161,7 +767,8 @@
       "action": "对比 write_catalog_entry 与 Table::update_rows 的调用约定：update_rows 期望 values 与 columns 平行，而 write_catalog_entry 传了整行两个值。",
       "output": "修复前：所有涉及写入的用例都失败于 type_mismatch: column def expects a string；修复后：通过用例从 1 个增加到 12 个。",
       "interpretation": "同一套 update_rows 同时服务用户表与目录表，调用方必须遵守 values 与 columns 平行的约定，否则整数会落进字符串列。",
-      "verification": "官方 run.py 复跑，12/20 PASS。"
+      "verification": "官方 run.py 复跑，12/20 PASS。",
+      "origin": "current"
     },
     {
       "id": "e4",
@@ -171,7 +778,8 @@
       "action": "核对 Table::compute_layout 的布局与 Table::row_size 的尺寸计算：row_size 对主键列多算了 8 字节，同时完全忽略了 16 字节对齐产生的填充。",
       "output": "CREATE TABLE docs(id BIGINT PRIMARY KEY, content VARCHAR(16)) 的布局需要 20+6=26 字节起步，字符串区落在偏移 32 处，而 row_size 只算出 20 字节；memcpy 6 个字节时越界 4 字节，堆上的字符串与向量被破坏，vector_float32 用例直接崩溃。",
       "interpretation": "行尺寸必须严格等于布局，否则写入会把后面的列覆盖掉；这解释了字符串截断、向量距离为 0 和进程崩溃三种表现。",
-      "verification": "改为按布局计算 row_size（向量区固定长度 + 字符串区总长），复跑官方用例 16/20 PASS，vector_float32 由崩溃转为 PASS。"
+      "verification": "改为按布局计算 row_size（向量区固定长度 + 字符串区总长），复跑官方用例 16/20 PASS，vector_float32 由崩溃转为 PASS。",
+      "origin": "current"
     },
     {
       "id": "e5",
@@ -181,7 +789,8 @@
       "action": "逐个验证四个候选点：page_count 对未打开文件返回 0；load_catalog 用 find_by_pk 查找而主键索引此时为空；apply_page_alloc 只回写 64 字节页头没有扩展文件长度；build_vector_index 把页内裸指针带出扫描。",
       "output": "四个点都被证实为真。修复后官方用例 20/20 PASS，storage_restart、storage_mutations、vector_index_maintenance 等带 --restart 的用例全部转绿。",
       "interpretation": "恢复路径与执行路径是两套代码，前者缺少针对「文件已存在但本进程没打开」「派生索引尚未建立」这类状态的显式处理。",
-      "verification": "官方 run.py 20/20 PASS。"
+      "verification": "官方 run.py 20/20 PASS。",
+      "origin": "current"
     },
     {
       "id": "e6",
@@ -191,7 +800,8 @@
       "action": "把 wal.log 的十六进制按「魔数 + 类型 + LSN + 长度 + 载荷 + CRC」的格式手工解码，逐字段对照代码。",
       "output": "PAGE_ALLOC 记录正常，PAGE_MODIFY 记录的载荷开头却是 'MVDB' 页头魔数而不是 table_id。根因是 write_records 里对 payload 调用 reserve 而非 resize，insert 覆盖掉了刚写好的记录头。改为先 resize 出 10+8*区间数 的记录头再追加区间内容。",
       "interpretation": "预写日志的记录格式必须与重放端严格一致；这里记录头被覆盖，导致重放把页面修改写到了错误的表和页上，页面修改从来没有真正落盘。",
-      "verification": "自写 crash_recovery.py 的五个阶段全部通过：崩溃后已提交行可见、未提交事务不可见、恢复途中再崩溃仍然幂等、提交后立刻崩溃数据仍在、干净关闭后数据仍在。"
+      "verification": "自写 crash_recovery.py 的五个阶段全部通过：崩溃后已提交行可见、未提交事务不可见、恢复途中再崩溃仍然幂等、提交后立刻崩溃数据仍在、干净关闭后数据仍在。",
+      "origin": "current"
     },
     {
       "id": "e7",
@@ -201,7 +811,8 @@
       "action": "写 profile_queries.py，把表规模从 100 行变到 10000 行，分别测量无距离列的纯扫描、带距离的精确检索、带过滤的检索，以及 ann 模式。",
       "output": "本地（Windows Docker Desktop）下所有查询形态都是 1.3~1.8 ms/查询，与表规模几乎无关；在远端 Linux 上同样的脚本是 0.217~0.361 ms/查询。",
       "interpretation": "本地那 1.3 ms 是 Windows 宿主机与 Linux 虚拟机之间的 docker CLI 管道转发开销，不是数据库的计算开销；只有远端原生 Linux 的数字才有参考价值。这也验证了用户提出的「本地指标不能照搬」。",
-      "verification": "远端 Linux 上：无距离纯扫描 0.248 ms、带距离精确 0.353 ms、ann 0.361 ms；本地数字全部标注为非官方结果。"
+      "verification": "远端 Linux 上：无距离纯扫描 0.248 ms、带距离精确 0.353 ms、ann 0.361 ms；本地数字全部标注为非官方结果。",
+      "origin": "current"
     },
     {
       "id": "e8",
@@ -211,7 +822,8 @@
       "action": "给 HnswIndex::search 增加 ef 参数，候选预算从 max(4K,64) 起步，过滤后不足 K 条时按 4 倍递增直到全表，最后再回退精确扫描保证条数正确。",
       "output": "本地 benchmark 10,000 行 / 128 维 / 1,000 次查询：recall_avg、recall_filtered、recall_unfiltered 均为 1.0，ann 查询 1.798 s，exact 参考 1.808 s；写阶段 14.256 s（100 条一批提交 100 批），启动时重建索引 0.318 s，容器峰值内存约 33 MiB。",
       "interpretation": "召回率留足余量是硬要求（低于 0.95 则性能项直接为 0），因此只在过滤把候选吃光时才扩大预算，其余情况保持小预算。",
-      "verification": "官方 20 个用例在改动后依然全部 PASS，崩溃恢复五阶段依然全部通过。"
+      "verification": "官方 20 个用例在改动后依然全部 PASS，崩溃恢复五阶段依然全部通过。",
+      "origin": "current"
     },
     {
       "id": "e9",
@@ -221,7 +833,8 @@
       "action": "把源码打包上传到远端 Ubuntu 24.04 服务器，用 sudo docker build 构建镜像，再在服务器上运行题包自带的 protocol_check/run.py 与自写的崩溃恢复脚本。",
       "output": "远端构建成功；同一份源码在远端跑出与本地一致的协议行为；服务器只有 2 核 2 GB，本地 Windows Docker Desktop 上测得的绝对耗时不能代表服务器表现。",
       "interpretation": "功能结论可以迁移，绝对性能数字不能迁移，因此文档中的性能数据一律标注为本地/服务器自测，且注明不是官方平台结果。",
-      "verification": "远端 protocol_check/run.py 与 crash_recovery.py 的输出见 docs/minivectordb-verification.md。"
+      "verification": "远端 protocol_check/run.py 与 crash_recovery.py 的输出见 docs/minivectordb-verification.md。",
+      "origin": "current"
     },
     {
       "id": "e10",
@@ -231,7 +844,8 @@
       "action": "写 count_rows.py：插入 N 行，分别统计会话内与重启后能查到的行数；再回到 Storage::alloc_page() 读它的取页号逻辑。",
       "output": "插入 5000 行、语句全部返回成功，但会话内与重启后都只能查到 536 行。alloc_page() 用 lseek(SEEK_END)/页大小 来决定新页号，而文件只有在脏页被写回时才增长；缓冲池没有换出时文件长度一直是 0，于是每次分配都返回页 0，页 0 的页头被重置、槽位目录从头覆盖，旧行就此不可见。",
       "interpretation": "页号必须由内存里的分配器单调发放，文件长度只是结果而不是分配依据；否则在没有换页压力时所有分配都会落到同一页。公开用例每张表只有几行、只占一页，所以完全测不到这个问题。",
-      "verification": "改为在内存中按表维护下一个空闲页号，分配时用 ftruncate 把文件扩展到整页；重测后插入 5000 行可见 5000 行、插入 10000 行可见 10000 行，重启后同样可见。"
+      "verification": "改为在内存中按表维护下一个空闲页号，分配时用 ftruncate 把文件扩展到整页；重测后插入 5000 行可见 5000 行、插入 10000 行可见 10000 行，重启后同样可见。",
+      "origin": "current"
     },
     {
       "id": "e11",
@@ -241,7 +855,8 @@
       "action": "测量结果带向量 1.758 ms/行、不带向量 0.031 ms/行，相差 57 倍；随后审查 HnswIndex::ensure_node_slots() 的容量预留逻辑。",
       "output": "ensure_node_slots() 把容量正好预留成「当前节点数 + 1」，于是每次插入 data_（整块向量库）和 visit_stamp_ 都会重新分配并整体拷贝一遍，插入因此退化成平方复杂度。改成按倍数增长后，带向量的插入降到 0.290 ms/行，写阶段从 18.06 s 降到 2.43 s。",
       "interpretation": "std::vector::reserve 不会自动按倍数增长，显式写死「正好够用」会把线性插入变成平方。同一份代码在重建索引时之所以看起来快，是因为重建前 clear_state() 保留了大容量，前几千次插入没有触发重新分配。",
-      "verification": "修复后写阶段 2.432 s，公开用例 20/20 PASS，崩溃恢复五阶段仍然全部通过，召回率仍为 1.0。"
+      "verification": "修复后写阶段 2.432 s，公开用例 20/20 PASS，崩溃恢复五阶段仍然全部通过，召回率仍为 1.0。",
+      "origin": "current"
     },
     {
       "id": "e12",
@@ -251,7 +866,8 @@
       "action": "在本地把推送后的分支重新克隆到干净目录，用该目录的 Dockerfile 构建镜像；服务器上做同样的事时先遇到一次 TLS 断连（服务器到 GitHub 的网络问题，与仓库无关），于是先在本地完成克隆验证。",
       "output": "全新克隆后构建失败：/src/minivectordb/build.sh: 4: set: Illegal option -。原因是这台 Windows 机器的 git 配置 core.autocrlf=true，克隆时把仓库里的 LF 换行转成了 CRLF，而 shell 脚本里的 set -e 因此报错。",
       "interpretation": "仓库里存的是 LF（git ls-files --eol 显示 i/lf），Linux 平台本来不会出问题，但「本地能构建」这种假设本身就是不可靠的验证方式；只要有一条路径能让构建失败，提交物就不该被当成可构建。修复方式是在 .gitattributes 里对 Dockerfile、*.sh 和 minivectordb 的源码、脚本固定 text eol=lf，同时在 Dockerfile 里执行脚本前用 sed 去掉残留的回车，两道保险。",
-      "verification": "再次全新克隆，build.sh 的 CR 字节数为 0，镜像构建成功，官方 20 个公开用例全部 PASS，崩溃恢复五阶段全部通过。"
+      "verification": "再次全新克隆，build.sh 的 CR 字节数为 0，镜像构建成功，官方 20 个公开用例全部 PASS，崩溃恢复五阶段全部通过。",
+      "origin": "current"
     },
     {
       "id": "e13",
@@ -261,7 +877,8 @@
       "action": "在仓库里新增 .github/workflows/minivectordb-ci.yml，push 到 2026-competition-round2 触发。流水线依次执行：docker build --pull 从源码构建镜像；题包自带的 protocol_check/run.py --image 指向刚构建的镜像；minivectordb/tests/crash_recovery.py；带 -Wall -Wextra 的独立编译并把 warning 视为失败；提交物与 agent/conversation.json 合规检查。",
       "output": "run 43445374969 结论 success，20 个公开用例逐条 PASS（单项 251~490 ms），崩溃恢复五个阶段全部通过，编译阶段无 warning，agent/conversation.json 校验为 23,715 字节的合法 JSON。构建阶段实际安装的是 g++-13=13.3.0-6ubuntu2~24.04.1，说明按 digest 固定的 ubuntu:24.04 与锁定编译器版本在官方镜像源上仍然可得。",
       "interpretation": "CI 的价值不只是再跑一遍用例：它同时验证了「锁定版本仍可安装」这一条假设——如果 Ubuntu 源撤下了那个 g++-13 版本，Dockerfile 的构建会在这里先失败，而这类失败在本地因为有缓存镜像而不暴露。流水线里的容器同样是 --network=none、--read-only、只挂 /data，与判题时的容器边界一致。",
-      "verification": "https://github.com/lyx88815313/seekdb-2026/actions/runs/43445374969 结论 success；公开镜像仓库上同一次提交的 run 43445389206 同样为 success。"
+      "verification": "https://github.com/lyx88815313/seekdb-2026/actions/runs/43445374969 结论 success；公开镜像仓库上同一次提交的 run 43445389206 同样为 success。",
+      "origin": "current"
     },
     {
       "id": "e14",
@@ -271,7 +888,8 @@
       "action": "写探针覆盖投影列名、WHERE 中的表达式比较、数字字面量各种写法、语句尾多余分号，对两个镜像跑同一份脚本并逐行比对响应。",
       "output": "本次提交有两处缺陷：其一，无别名 L2_DISTANCE 投影的列名是 \"L2_DISTANCE(embedding,'[0,0]') FROM\"，多了一个 FROM；根因在 sql.cpp 截取表达式文本时用的是 peek().end，而此时 peek() 已经是 ')' 之后的 FROM token，db.cpp 又直接把它当作默认列名。其二，数字字面量不接受前导 '+'，'+1'、'+3'、'LIMIT +1'、'VARCHAR(+8)' 全部被拒。旧实现两处都更接近 MySQL：列名是 \"L2_DISTANCE\"，且前导 '+' 按 strtod 的读法接受——旧团队用穷举扫描把它列为唯一确认的语义分歧并明确修过。",
       "interpretation": "默认列名应当是表达式原文，MySQL 就是这么做的；顺带确认了 UTF-8 的字节序与码点序一致，所以按字节比较 VARCHAR 并不违反码点序要求，公开用例也没有区分这两者。前导 '+' 的取舍要看赛题对「数值」的定义：'+1.5' 是可表示为有限 float32 的数值，strtod 与 MySQL 系都接受，因此按接受处理更稳妥。",
-      "verification": "修正后：默认列名为 \"L2_DISTANCE(embedding,'[0,0]')\"；'+1'、'+3'、'LIMIT +1' 全部接受；官方 20 个公开用例仍 20/20 PASS，29 条要求探针仍 29/29 通过，崩溃恢复五阶段通过，-O2 -std=c++17 -Wall -Wextra 编译零告警。"
+      "verification": "修正后：默认列名为 \"L2_DISTANCE(embedding,'[0,0]')\"；'+1'、'+3'、'LIMIT +1' 全部接受；官方 20 个公开用例仍 20/20 PASS，29 条要求探针仍 29/29 通过，崩溃恢复五阶段通过，-O2 -std=c++17 -Wall -Wextra 编译零告警。",
+      "origin": "current"
     },
     {
       "id": "e15",
@@ -281,8 +899,15 @@
       "action": "通读旧实现的 README 开发记录与提交历史，并用探针测量它对各类失败情形返回的错误码。",
       "output": "README 记录：连续 4 次正式提交都被平台判为「失败用例数 1：JSON response timeout」，修掉 ASan 定位的 SIGSEGV 后第 5 次仍同样报错，原因未确认，结论是「很可能是某个隐藏用例的语义分歧（错误码词汇、边界行为），需平台完整判题日志才能定位」，且此后没有再提测。探针实测：value_too_long、type_mismatch、table_not_found、column_not_found、invalid_vector，以及 JOIN、聚合、子查询、外键、主键更新、嵌套事务、两个向量列，全部返回同一个 sql_error，只有 duplicate_key、dimension_mismatch、unsupported_sql 是专属码。",
       "interpretation": "公开题包的 config 里 error_codes 是空对象，断言只校验错误码非空，所以本地怎么实现都能过；隐藏题包一旦冻结映射，错误码粒度就会直接决定成败。旧实现把十几种语义塌缩成一个码，等于把这一大片题面覆盖押在「隐藏包不校验具体码」上。另一个事实是：旧实现的 Dockerfile 既没按 digest 固定基础镜像，也没锁 apt 包版本，与赛题对依赖锁版本的要求不符。",
-      "verification": "旧实现 aa7ef30 与实际提交的 9f0508d2 两个版本各自用官方 protocol_check 跑公开用例，都是 20/20 PASS；无缓存重建零编译告警；29 条要求探针全部通过。结论是它的功能实现扎实，短板在提交纪律（提测后未回归验证）和错误码/依赖锁定这类非功能项。"
+      "verification": "旧实现 aa7ef30 与实际提交的 9f0508d2 两个版本各自用官方 protocol_check 跑公开用例，都是 20/20 PASS；无缓存重建零编译告警；29 条要求探针全部通过。结论是它的功能实现扎实，短板在提交纪律（提测后未回归验证）和错误码/依赖锁定这类非功能项。",
+      "origin": "current"
     }
+  ],
+  "early_attempt_limitations": [
+    "本记录中的测试由 Agent 委派工具执行，不把 Agent 的规划或测试冒充学生独立学习证据。",
+    "当前版本尚无 checkpoint、日志压缩、ANN 和 SIMD；Docker 镜像构建与容器内官方检查已通过。",
+    "当前用户无法创建独立 cgroup，资源结果仅为采样 RSS 和墙钟预实验，不是 memory.peak/io.stat 正式验收。",
+    "排序段路径元数据随段数增长，单行与单条 SQL 解析仍需自身大小的内存；排序批次预算不是完整进程硬内存上限。"
   ],
   "retrospective": "这次开发里最有价值的一次判断发生在性能测量环节：改完排序逻辑后耗时没有变化，说明我原先的成本模型是错的，于是先做测量再继续改，结果发现 1.3 ms 的固定开销来自 Windows 到 Linux 虚拟机的管道转发，与数据库无关——如果当时继续按错误模型调优，会把时间花在不影响平台成绩的地方。同类教训还有三次：id 回显、目录写入、行尺寸，都属于「看起来是 SQL 语义问题，实际是内存与调用约定问题」，靠读代码和手工解码二进制才定位到。恢复路径的四次缺陷也说明，执行路径与恢复路径要分开测：前者测的是语句语义，后者测的是「文件已存在但进程没打开」「派生索引尚未建立」这类中间状态。最危险的一次是两个互相掩护的缺陷：公开用例每张表只有几行、只占一页，所以分页逻辑从未被触发；规模放大后 alloc_page 把所有新页都发成页 0，旧行被静默覆盖，而召回率对比之所以没有报警，是因为 exact 与 ann 两条路径看到的是同一份被截断的数据。是「启动日志里重建索引只看到 110 行」这一条旁证把问题牵出来的——如果当时只相信公开用例全绿就提交，这次提交会直接被功能准入一票否决。另一条教训来自收尾：从公开地址全新克隆后再构建，发现 Windows 的 core.autocrlf 把换行转成 CRLF，构建脚本直接不可执行；本地工作目录能构建并不能证明平台能构建，所以最后一轮验证一律以「全新克隆 + 构建 + 官方用例」为准。收尾阶段又补了两件事：一是把构建、官方用例、崩溃恢复与合规检查固化成 GitHub Actions 流水线，在 ubuntu-24.04 runner 上复测通过（run 43445374969，20/20 PASS），这样每次改动都能在提交前拿到第三方环境的信号，也顺带验证了锁定的 g++-13 版本在官方镜像源上仍然可得——本地有缓存镜像时这类失败是看不见的；二是提测时核实到目标仓库是私有的，评测方需要被授权，这件事本该在动手之前就确认。最后一次收尾是复查另一份旧实现：把两边放进同一台机器跑同一组探针，才发现自己的无别名投影列名多带了一个 FROM、数字字面量也不接受前导加号——这些在公开用例里全都测不出来。旧实现那边的教训更直接：它连续四次正式提交都被平台判失败，修完再提测仍然失败，而根因到最后都没有确认。公开用例全绿只说明公开用例全绿，它挡不住隐藏用例里的错误码词汇和边界行为。取舍上，我优先保证公开用例、崩溃恢复与可见行数全部正确、召回率留足余量，再考虑速度，因为功能准入和召回率是硬门槛，速度只影响排名。",
   "limitations": [
