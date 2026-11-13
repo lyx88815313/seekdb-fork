@@ -410,3 +410,13 @@ seekdb_data/
 deps/ios-build/__pycache__/
 /protocol-results/
 /protocol_check/__pycache__/
+
+# Local build output of minivectordb/build.sh
+/build/
+/minivectordb/build/
+
+# Local test reports of the official protocol driver
+/protocol-results/
+/protocol_check/__pycache__/
+__pycache__/
+*.pyc

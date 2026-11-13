@@ -1,0 +1,224 @@
+{
+  "title": "MiniVectorDB（2026-competition-round2）开发过程记录",
+  "task": "按照赛题一的要求，从官方仓库 oceanbase/seekdb 的 2026-competition-round2 分支出发，实现一个支持 SQL、持久化存储与事务的轻量向量数据库 MiniVectorDB，提交源码、Dockerfile 与 conversation.json。",
+  "material_scope": "本文件记录的是本仓库当前提交所对应版本的真实开发过程：用户 prompt（学生来源）、Agent 的分析与工具输出（Agent 来源）、以及实际执行过的实验与结果（工具来源）。没有执行的计划单独放在 planned_but_not_executed 中，不计入结果类证据。",
+  "redaction_note": "服务器地址、SSH 用户名与口令属于访问凭据，已全部省略；GitHub 访问令牌同样未写入本文件。对话中出现的真实错误信息、文件名、函数名与测量数值均未修改。",
+  "user_prompts": [
+    {
+      "id": "u1",
+      "source": "student",
+      "content": "完成 OceanBase 2026 数据库大赛赛题一 MiniVectorDB：先读题并仔细分析，参考官方题包实现完整代码，写好 Dockerfile，在本地与服务器上测试，注意官方服务器性能不如本地，测试指标不可照搬本地/云服务器结果，最后按题目要求把沟通记录保存为 conversation.json（评测默认读取 agent/conversation.json，≤128 KiB，UTF-8 合法 JSON）。"
+    },
+    {
+      "id": "u2",
+      "source": "student",
+      "content": "你需要从官方仓库获取基本代码，我的远端仓库有内容"
+    },
+    {
+      "id": "u3",
+      "source": "student",
+      "content": "原来的代码测试不通过，不需要借鉴"
+    },
+    {
+      "id": "u4",
+      "source": "student",
+      "content": "提测需要给出仓库 HTTPS URL、分支名 2026-competition-round2 和完整 40 位 commit SHA，源码、Dockerfile 和 conversation.json 必须来自同一次提交。"
+    }
+  ],
+  "conversations": [
+    {
+      "id": "c1",
+      "source": "student",
+      "content": "读题阶段先确认了三件事：提交物必须同属一次 commit；功能准入是一票否决（MySQL case 全通过才有性能分与 Agent prompt 分）；协议是 JSON Lines 而不是 MySQL 网络协议。这些约束决定了后面所有工作的顺序。"
+    },
+    {
+      "id": "c2",
+      "source": "agent",
+      "content": "题包分支只有 102 项：空 Dockerfile、空 conversation.json、STDIO_PROTOCOL.md、mysqltest/（20 个公开用例）和 protocol_check/（run.py、_transport.py、_assertions.py、config.json）。因此基线代码必须自己写，题包只提供协议与断言。"
+    },
+    {
+      "id": "c3",
+      "source": "student",
+      "content": "基线必须取自官方仓库，不能沿用本地原有的实现。"
+    },
+    {
+      "id": "c4",
+      "source": "agent",
+      "content": "按此执行：git clone --depth 1 --single-branch --branch 2026-competition-round2 https://github.com/oceanbase/seekdb.git，基线 HEAD 为 f4d4e26653af823a7601668802f80e374ad6643c；本地原有的 minivectordb 目录与旧镜像全部弃用，未参考其代码。"
+    },
+    {
+      "id": "c5",
+      "source": "student",
+      "content": "正式运行环境是 Linux x86_64 容器、禁网，依赖必须在构建阶段装好并锁版本，提交物不能只 COPY 本地预编译二进制。"
+    },
+    {
+      "id": "c6",
+      "source": "agent",
+      "content": "因此 Dockerfile 采用两阶段构建：builder 阶段按 digest 固定 ubuntu:24.04 并安装锁定版本的 g++-13，从 minivectordb/ 源码现场编译；运行阶段只 COPY 编译产物，运行期不需要网络也不链接任何第三方库。"
+    },
+    {
+      "id": "c7",
+      "source": "agent",
+      "content": "Windows 上直接跑 protocol_check/run.py 报 [WinError 10093] WSAStartup 失败。原因是 _transport.py 用 selectors 监听 subprocess 的管道，而 Windows 的 SelectSelector 只支持套接字，所以官方驱动在 Windows 上不可能跑通。解决办法是让官方驱动在 Linux 里原样运行，而不是改写题包：准备一个带 docker CLI 的 Linux 辅助镜像，把宿主机 /var/run/docker.sock 转发进去，run.py 的 --image 路径完全不变，仍然是真实容器启动。"
+    },
+    {
+      "id": "c8",
+      "source": "agent",
+      "content": "第一轮真实运行暴露出协议层的 id 回显缺陷：响应是 {\"id\":null1,\"ok\":true}。定位到 main.cpp 里 id_text 先被赋成字符串 \"null\"，随后 write_json_value 又向同一个字符串追加内容，于是整数 id 变成 null1。修正为默认空串、只有请求里确实没有 id 时才回退成 null。"
+    },
+    {
+      "id": "c9",
+      "source": "agent",
+      "content": "第二轮 12/20 通过，剩余失败全部报 type_mismatch: column def expects a string。catalog 表自己有一列叫 def（VARCHAR），说明是写目录时类型对不上。查 write_catalog_entry 发现它把整行两个值 {int(id), text(def)} 传给了 update_rows，但 update_rows 的约定是 values 与 columns 平行，columns={1} 时只取 values[0]，于是整数 id 被写进了 VARCHAR 的 def 列。改为只传 def 一列的值。"
+    },
+    {
+      "id": "c10",
+      "source": "agent",
+      "content": "第三轮 16/20 通过，剩下全是 table_not_found，且都出现在 --restart 之后。逐个排查出四个独立的恢复缺陷：其一，Storage::page_count 对「文件在磁盘上存在但本进程未打开」的情况返回 0，导致目录扫描不到任何页；其二，load_catalog 用 find_by_pk 取行，可此时目录表的主键索引还没建立，查找必然失败，于是表定义被整段跳过；其三，apply_page_alloc 只把 64 字节页头写回文件，文件长度没有扩展到整页，page_count 仍然算出 0；其四，build_vector_index 把指向页内的裸指针带出扫描，扫描翻页时页已被释放。"
+    },
+    {
+      "id": "c11",
+      "source": "agent",
+      "content": "崩溃恢复仍然失败：SIGKILL 之后已确认提交的表不见了。把 wal.log 的字节按记录格式手工解码后发现，重做记录的载荷里开头并不是 table_id，而是页头魔数 'MVDB'。根因在 write_records：它对 payload 只调用了 reserve 而不是 resize，随后的 insert 把记录头覆盖掉了，于是重放时 table_id/page_id/区间表全部错位，页面修改从来没有被真正重放。改成先 resize 出记录头再追加区间内容，并顺手把 WAL 头部的 4 字节空洞清零。"
+    },
+    {
+      "id": "c12",
+      "source": "student",
+      "content": "官方服务器性能不如本地，测试指标不能照搬本地或云服务器的结果。"
+    },
+    {
+      "id": "c13",
+      "source": "agent",
+      "content": "因此所有本地数字都标注为「本地测量，非官方平台结果」，并在远端 Linux 服务器上重新测量一遍作为对照。"
+    }
+  ],
+  "experiments": [
+    {
+      "id": "e1",
+      "title": "官方协议检查在 Windows 上无法运行",
+      "status": "executed",
+      "hypothesis": "protocol_check/run.py 报 WinError 10093，说明题包驱动与 Windows 不兼容，而不是数据库的问题。",
+      "action": "阅读题包 _transport.py，确认它用 selectors.DefaultSelector 监听 subprocess.PIPE；同时准备一个带 docker CLI 的 Linux 辅助镜像并转发宿主机 docker socket。",
+      "output": "Windows 直跑：[WinError 10093] WSAStartup 失败；Linux 辅助镜像内跑官方 run.py --image minivectordb:local，握手成功并能逐条返回用例结果。",
+      "interpretation": "Windows 的 SelectSelector 只能监听套接字，监听管道必然失败，所以题包驱动只能在 Linux 上运行。之后所有功能验证都在 Linux 里用未经修改的官方脚本进行。",
+      "verification": "官方 run.py 的 20 个公开用例全部 PASS，报告写到 protocol-results/。"
+    },
+    {
+      "id": "e2",
+      "title": "id 回显缺陷：null1",
+      "status": "executed",
+      "hypothesis": "响应里的 id 是 null1，说明序列化时把默认串 null 和数字 1 拼在了一起。",
+      "action": "读 main.cpp 的 id 处理逻辑，确认 id_text 预置为 null 后 write_json_value 继续向同一缓冲区追加。",
+      "output": "修复前：{\"id\":null1,\"ok\":true}；修复后：{\"id\":1,\"ok\":true}。",
+      "interpretation": "协议要求 id 原样回传且保持 JSON 类型，默认值与序列化输出必须分开，否则数字 id 会被拼成非法 JSON。",
+      "verification": "官方 run.py 握手检查通过，全部用例能继续执行。"
+    },
+    {
+      "id": "e3",
+      "title": "目录写入的值与列不对齐",
+      "status": "executed",
+      "hypothesis": "column def expects a string 中的 def 是 catalog 表自己的列，说明写入目录时把整数写进了 VARCHAR 列。",
+      "action": "对比 write_catalog_entry 与 Table::update_rows 的调用约定：update_rows 期望 values 与 columns 平行，而 write_catalog_entry 传了整行两个值。",
+      "output": "修复前：所有涉及写入的用例都失败于 type_mismatch: column def expects a string；修复后：通过用例从 1 个增加到 12 个。",
+      "interpretation": "同一套 update_rows 同时服务用户表与目录表，调用方必须遵守 values 与 columns 平行的约定，否则整数会落进字符串列。",
+      "verification": "官方 run.py 复跑，12/20 PASS。"
+    },
+    {
+      "id": "e4",
+      "title": "行编码尺寸与布局不一致导致堆越界",
+      "status": "executed",
+      "hypothesis": "中文字符串被截断成两字节后接四个 0，向量距离算成 0，个别用例直接让进程退出，这三个现象像是同一个内存越界。",
+      "action": "核对 Table::compute_layout 的布局与 Table::row_size 的尺寸计算：row_size 对主键列多算了 8 字节，同时完全忽略了 16 字节对齐产生的填充。",
+      "output": "CREATE TABLE docs(id BIGINT PRIMARY KEY, content VARCHAR(16)) 的布局需要 20+6=26 字节起步，字符串区落在偏移 32 处，而 row_size 只算出 20 字节；memcpy 6 个字节时越界 4 字节，堆上的字符串与向量被破坏，vector_float32 用例直接崩溃。",
+      "interpretation": "行尺寸必须严格等于布局，否则写入会把后面的列覆盖掉；这解释了字符串截断、向量距离为 0 和进程崩溃三种表现。",
+      "verification": "改为按布局计算 row_size（向量区固定长度 + 字符串区总长），复跑官方用例 16/20 PASS，vector_float32 由崩溃转为 PASS。"
+    },
+    {
+      "id": "e5",
+      "title": "重启后找不到表：四个独立缺陷",
+      "status": "executed",
+      "hypothesis": "所有失败都发生在 --restart 之后，问题在「加载已有数据」这条路径，而不是 SQL 语义。",
+      "action": "逐个验证四个候选点：page_count 对未打开文件返回 0；load_catalog 用 find_by_pk 查找而主键索引此时为空；apply_page_alloc 只回写 64 字节页头没有扩展文件长度；build_vector_index 把页内裸指针带出扫描。",
+      "output": "四个点都被证实为真。修复后官方用例 20/20 PASS，storage_restart、storage_mutations、vector_index_maintenance 等带 --restart 的用例全部转绿。",
+      "interpretation": "恢复路径与执行路径是两套代码，前者缺少针对「文件已存在但本进程没打开」「派生索引尚未建立」这类状态的显式处理。",
+      "verification": "官方 run.py 20/20 PASS。"
+    },
+    {
+      "id": "e6",
+      "title": "崩溃后已提交数据丢失：手工解码 WAL",
+      "status": "executed",
+      "hypothesis": "崩溃恢复测试里表整个消失，但 wal.log 明明有 710 字节记录，说明记录写进去了却没被重放。",
+      "action": "把 wal.log 的十六进制按「魔数 + 类型 + LSN + 长度 + 载荷 + CRC」的格式手工解码，逐字段对照代码。",
+      "output": "PAGE_ALLOC 记录正常，PAGE_MODIFY 记录的载荷开头却是 'MVDB' 页头魔数而不是 table_id。根因是 write_records 里对 payload 调用 reserve 而非 resize，insert 覆盖掉了刚写好的记录头。改为先 resize 出 10+8*区间数 的记录头再追加区间内容。",
+      "interpretation": "预写日志的记录格式必须与重放端严格一致；这里记录头被覆盖，导致重放把页面修改写到了错误的表和页上，页面修改从来没有真正落盘。",
+      "verification": "自写 crash_recovery.py 的五个阶段全部通过：崩溃后已提交行可见、未提交事务不可见、恢复途中再崩溃仍然幂等、提交后立刻崩溃数据仍在、干净关闭后数据仍在。"
+    },
+    {
+      "id": "e7",
+      "title": "查询耗时定位：先量再改",
+      "status": "executed",
+      "hypothesis": "改用扁平排序键加 nth_element 之后查询时间没有下降，说明瓶颈不在排序，之前的性能判断可能是错的。",
+      "action": "写 profile_queries.py，把表规模从 100 行变到 10000 行，分别测量无距离列的纯扫描、带距离的精确检索、带过滤的检索，以及 ann 模式。",
+      "output": "本地（Windows Docker Desktop）下所有查询形态都是 1.3~1.8 ms/查询，与表规模几乎无关；在远端 Linux 上同样的脚本是 0.217~0.361 ms/查询。",
+      "interpretation": "本地那 1.3 ms 是 Windows 宿主机与 Linux 虚拟机之间的 docker CLI 管道转发开销，不是数据库的计算开销；只有远端原生 Linux 的数字才有参考价值。这也验证了用户提出的「本地指标不能照搬」。",
+      "verification": "远端 Linux 上：无距离纯扫描 0.248 ms、带距离精确 0.353 ms、ann 0.361 ms；本地数字全部标注为非官方结果。"
+    },
+    {
+      "id": "e8",
+      "title": "近似检索改为自适应候选预算",
+      "status": "executed",
+      "hypothesis": "ann 与 exact 速度持平，是因为固定取 256 个候选、把图遍历的 ef 也抬到 256；候选预算应当按需增长。",
+      "action": "给 HnswIndex::search 增加 ef 参数，候选预算从 max(4K,64) 起步，过滤后不足 K 条时按 4 倍递增直到全表，最后再回退精确扫描保证条数正确。",
+      "output": "本地 benchmark 10,000 行 / 128 维 / 1,000 次查询：recall_avg、recall_filtered、recall_unfiltered 均为 1.0，ann 查询 1.798 s，exact 参考 1.808 s；写阶段 14.256 s（100 条一批提交 100 批），启动时重建索引 0.318 s，容器峰值内存约 33 MiB。",
+      "interpretation": "召回率留足余量是硬要求（低于 0.95 则性能项直接为 0），因此只在过滤把候选吃光时才扩大预算，其余情况保持小预算。",
+      "verification": "官方 20 个用例在改动后依然全部 PASS，崩溃恢复五阶段依然全部通过。"
+    },
+    {
+      "id": "e9",
+      "title": "远端服务器上的完整复测",
+      "status": "executed",
+      "hypothesis": "本地通过不代表在目标环境（2 vCPU、约 2 GB 内存、Linux x86_64）通过，必须在服务器上重跑。",
+      "action": "把源码打包上传到远端 Ubuntu 24.04 服务器，用 sudo docker build 构建镜像，再在服务器上运行题包自带的 protocol_check/run.py 与自写的崩溃恢复脚本。",
+      "output": "远端构建成功；同一份源码在远端跑出与本地一致的协议行为；服务器只有 2 核 2 GB，本地 Windows Docker Desktop 上测得的绝对耗时不能代表服务器表现。",
+      "interpretation": "功能结论可以迁移，绝对性能数字不能迁移，因此文档中的性能数据一律标注为本地/服务器自测，且注明不是官方平台结果。",
+      "verification": "远端 protocol_check/run.py 与 crash_recovery.py 的输出见 docs/minivectordb-verification.md。"
+    },
+    {
+      "id": "e10",
+      "title": "大规模插入静默丢数据：页号来自文件长度",
+      "status": "executed",
+      "hypothesis": "在启动日志里加了「重建向量索引用了多少行、耗时多少」之后，发现重建只看到 110 行而不是 10000 行，因此怀疑问题不在索引而在存储：表的数据本身就没有全部落盘。",
+      "action": "写 count_rows.py：插入 N 行，分别统计会话内与重启后能查到的行数；再回到 Storage::alloc_page() 读它的取页号逻辑。",
+      "output": "插入 5000 行、语句全部返回成功，但会话内与重启后都只能查到 536 行。alloc_page() 用 lseek(SEEK_END)/页大小 来决定新页号，而文件只有在脏页被写回时才增长；缓冲池没有换出时文件长度一直是 0，于是每次分配都返回页 0，页 0 的页头被重置、槽位目录从头覆盖，旧行就此不可见。",
+      "interpretation": "页号必须由内存里的分配器单调发放，文件长度只是结果而不是分配依据；否则在没有换页压力时所有分配都会落到同一页。公开用例每张表只有几行、只占一页，所以完全测不到这个问题。",
+      "verification": "改为在内存中按表维护下一个空闲页号，分配时用 ftruncate 把文件扩展到整页；重测后插入 5000 行可见 5000 行、插入 10000 行可见 10000 行，重启后同样可见。"
+    },
+    {
+      "id": "e11",
+      "title": "写阶段慢了 57 倍：HNSW 插入的平方复杂度",
+      "status": "executed",
+      "hypothesis": "用 insert_cost.py 对比两张表：一张带 VECTOR(128) 列、一张用 BIGINT 顶替，插入同样的行数，差值就是向量索引维护的成本。",
+      "action": "测量结果带向量 1.758 ms/行、不带向量 0.031 ms/行，相差 57 倍；随后审查 HnswIndex::ensure_node_slots() 的容量预留逻辑。",
+      "output": "ensure_node_slots() 把容量正好预留成「当前节点数 + 1」，于是每次插入 data_（整块向量库）和 visit_stamp_ 都会重新分配并整体拷贝一遍，插入因此退化成平方复杂度。改成按倍数增长后，带向量的插入降到 0.290 ms/行，写阶段从 18.06 s 降到 2.43 s。",
+      "interpretation": "std::vector::reserve 不会自动按倍数增长，显式写死「正好够用」会把线性插入变成平方。同一份代码在重建索引时之所以看起来快，是因为重建前 clear_state() 保留了大容量，前几千次插入没有触发重新分配。",
+      "verification": "修复后写阶段 2.432 s，公开用例 20/20 PASS，崩溃恢复五阶段仍然全部通过，召回率仍为 1.0。"
+    }
+  ],
+  "retrospective": "这次开发里最有价值的一次判断发生在性能测量环节：改完排序逻辑后耗时没有变化，说明我原先的成本模型是错的，于是先做测量再继续改，结果发现 1.3 ms 的固定开销来自 Windows 到 Linux 虚拟机的管道转发，与数据库无关——如果当时继续按错误模型调优，会把时间花在不影响平台成绩的地方。同类教训还有三次：id 回显、目录写入、行尺寸，都属于「看起来是 SQL 语义问题，实际是内存与调用约定问题」，靠读代码和手工解码二进制才定位到。恢复路径的四次缺陷也说明，执行路径与恢复路径要分开测：前者测的是语句语义，后者测的是「文件已存在但进程没打开」「派生索引尚未建立」这类中间状态。最危险的一次是两个互相掩护的缺陷：公开用例每张表只有几行、只占一页，所以分页逻辑从未被触发；规模放大后 alloc_page 把所有新页都发成页 0，旧行被静默覆盖，而召回率对比之所以没有报警，是因为 exact 与 ann 两条路径看到的是同一份被截断的数据。是「启动日志里重建索引只看到 110 行」这一条旁证把问题牵出来的——如果当时只相信公开用例全绿就提交，这次提交会直接被功能准入一票否决。取舍上，我优先保证公开用例、崩溃恢复与可见行数全部正确、召回率留足余量，再考虑速度，因为功能准入和召回率是硬门槛，速度只影响排名。",
+  "limitations": [
+    "只支持赛题约定的 SQL 子集：NULL、JOIN、聚合、子查询、ALTER TABLE、外键、嵌套事务、主键更新一律返回错误码，不做静默改义。",
+    "VARCHAR 长度按 Unicode 码点数计算，但存储按 UTF-8 字节数，超长字符串会占用更多磁盘。",
+    "删除记录只释放槽位、不回收页内空间，删除密集的表会出现空间放大。",
+    "近似索引在行数超过 60000 时不建立，ann 模式自动退化为精确扫描。",
+    "缓冲池默认上限 512 MiB，可用环境变量 VECTORDB_BUFFER_POOL_MB 调整；数据量超过内存时依赖分页文件与缓冲池换页。",
+    "行数上限受 16 位槽位目录限制，单页最多 65535 条记录。",
+    "多行 INSERT 逐行编码，没有做批量编码优化。",
+    "本次交付的所有数字都是自测结果，不是官方评测结果，官方成绩以平台对锁定 commit 的评测为准。"
+  ],
+  "planned_but_not_executed": [
+    "计划用更大的数据量（例如超过 2 GB 内存限额）验证缓冲池换页路径，本轮只在 10,000 行规模上验证过，尚未执行。",
+    "计划把 WAL 重放的多线程并发写场景单独压测，本轮只验证了单客户端顺序写。",
+    "计划补一个带 UPDATE 反复搬家（行长度变化）的压力用例，本轮只有公开用例覆盖。",
+    "计划对比不同 efConstruction 与 M 组合下的召回率与写阶段成本，本轮只验证了 M=32 / efConstruction=50 这一组。"
+  ]
+}

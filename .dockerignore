@@ -1,0 +1,11 @@
+# Build artifacts of a previous local build
+build/
+minivectordb/build/
+
+# Local test reports
+protocol-results/
+
+# Version control and caches
+.git/
+**/__pycache__/
+*.pyc
