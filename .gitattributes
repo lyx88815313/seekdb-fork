@@ -24,3 +24,4 @@ conversation.json text eol=lf
 agent/conversation.json text eol=lf
 README.md text eol=lf
 docs/*.md text eol=lf
+.github/workflows/minivectordb-ci.yml text eol=lf

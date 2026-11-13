@@ -1,0 +1,138 @@
+# Continuous integration for the MiniVectorDB submission.
+#
+# The workflow builds the submission image from the sources in this repository
+# and then drives it with the official public protocol checker that ships with
+# the competition package (protocol_check/run.py). The checker starts the
+# container exactly the way the judge does: no network, read-only root file
+# system, a writable volume at /data and a strict JSON-lines handshake.
+#
+# Everything reported here is a local diagnostic of the repository under test.
+# It carries no performance score and it calls no platform callback.
+
+name: MiniVectorDB CI
+
+on:
+  push:
+    branches:
+      - '2026-competition-round2'
+  pull_request:
+    branches:
+      - '2026-competition-round2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: minivectordb-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  public-protocol-check:
+    name: Build the image and run the official public cases
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the submission
+        uses: actions/checkout@v4
+
+      - name: Show the runner environment
+        run: |
+          docker version
+          python3 --version
+
+      - name: Build the submission image from source
+        run: docker build --pull -t minivectordb:ci .
+
+      - name: Compile from source and fail on compiler warnings
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh minivectordb/build.sh "$RUNNER_TEMP/minivectordb" 2>&1 | tee "$RUNNER_TEMP/compile.log"
+          if grep -q "warning:" "$RUNNER_TEMP/compile.log"; then
+            echo "::error::the compiler emitted warnings"
+            grep "warning:" "$RUNNER_TEMP/compile.log"
+            exit 1
+          fi
+
+      - name: Run the official public protocol check
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          python3 protocol_check/run.py --image minivectordb:ci --output "$RUNNER_TEMP/reports/public"
+
+      - name: Summarise the public check report
+        if: always()
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/reports/public/result.json"
+          if [ -f "$report" ]; then
+            python3 - "$report" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          print(f"passed={report['passed']} cases={len(report['cases'])}")
+          for case in report["cases"]:
+              print(f"  {case['id']}: {case['status']} ({case['duration_ms']} ms) {case['message']}")
+          PY
+          fi
+
+      - name: Run the crash recovery self test
+        run: python3 minivectordb/tests/crash_recovery.py --image minivectordb:ci
+
+      - name: Upload the check reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minivectordb-check-reports
+          path: ${{ runner.temp }}/reports
+          if-no-files-found: warn
+
+  submission-hygiene:
+    name: Check the submission layout and the agent material
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the submission
+        uses: actions/checkout@v4
+
+      - name: Validate the required files and the agent material
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(".")
+          required = [
+              "Dockerfile",
+              "README.md",
+              "conversation.json",
+              "agent/conversation.json",
+              "minivectordb/build.sh",
+              "minivectordb/src/main.cpp",
+              "protocol_check/run.py",
+              "mysqltest/manifest.json",
+          ]
+          missing = [name for name in required if not (root / name).is_file()]
+          if missing:
+              print("::error::missing submission files: " + ", ".join(missing))
+              sys.exit(1)
+
+          data = (root / "agent" / "conversation.json").read_bytes()
+          limit = 128 * 1024
+          if len(data) > limit:
+              print(f"::error::agent/conversation.json is {len(data)} bytes, over the {limit} byte limit")
+              sys.exit(1)
+          try:
+              parsed = json.loads(data.decode("utf-8"))
+          except Exception as exc:
+              print(f"::error::agent/conversation.json is not valid UTF-8 JSON: {exc}")
+              sys.exit(1)
+          if not isinstance(parsed, dict) or not parsed:
+              print("::error::agent/conversation.json is not a non-empty JSON object")
+              sys.exit(1)
+          if (root / "conversation.json").read_bytes() != data:
+              print("::error::conversation.json and agent/conversation.json differ")
+              sys.exit(1)
+          print(f"agent material ok: {len(data)} bytes, top level keys: {sorted(parsed)}")
+          PY
