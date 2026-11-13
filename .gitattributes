@@ -10,3 +10,13 @@
 *.i filter=codeformat
 *.ic filter=codeformat
 *.js filter=codeformat
+
+# The MiniVectorDB build scripts and sources must keep Unix line endings: a
+# checkout on a machine with core.autocrlf enabled would otherwise turn the
+# shell scripts into files that the shell refuses to execute.
+Dockerfile text eol=lf
+*.sh text eol=lf
+minivectordb/src/*.cpp text eol=lf
+minivectordb/src/*.hpp text eol=lf
+minivectordb/benchmark/*.py text eol=lf
+minivectordb/tests/*.py text eol=lf

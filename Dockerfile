@@ -22,7 +22,10 @@ RUN set -eux; \
 
 WORKDIR /src
 COPY minivectordb/ /src/minivectordb/
-RUN sh /src/minivectordb/build.sh /src/build/minivectordb
+# The build script is executed by the shell, so any carriage returns that a
+# checkout with Windows line endings could have introduced are removed first.
+RUN sed -i 's/\r$//' /src/minivectordb/build.sh \
+    && sh /src/minivectordb/build.sh /src/build/minivectordb
 
 FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5
 
