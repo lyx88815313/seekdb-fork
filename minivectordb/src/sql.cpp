@@ -299,19 +299,22 @@ class Parser {
       literal.kind = Literal::Kind::Null;
       return literal;
     }
-    if (token.kind == Tok::Symbol && token.text == "-") {
+    if (token.kind == Tok::Symbol && (token.text == "-" || token.text == "+")) {
+      // A leading sign is part of the literal, exactly as strtod and the
+      // MySQL family read '+1', '-1.5' and friends.
+      const bool negative = token.text == "-";
       advance();
       const Token& number = peek();
       if (number.kind == Tok::Int) {
         advance();
         literal.kind = Literal::Kind::Int;
-        literal.integer = -number.integer;
+        literal.integer = negative ? -number.integer : number.integer;
         return literal;
       }
       if (number.kind == Tok::Float) {
         advance();
         literal.kind = Literal::Kind::Double;
-        literal.number = -number.number;
+        literal.number = negative ? -number.number : number.number;
         return literal;
       }
     }
@@ -346,6 +349,7 @@ class Parser {
         } else if (type == "varchar") {
           column.kind = ColKind::VarChar;
           expect_symbol("(");
+          if (is_symbol("+")) advance();  // an unsigned integer may carry a sign
           const Token& length = peek();
           if (length.kind != Tok::Int) {
             throw_error("syntax_error", "VARCHAR requires an integer length");
@@ -357,6 +361,7 @@ class Parser {
         } else if (type == "vector") {
           column.kind = ColKind::Vector;
           expect_symbol("(");
+          if (is_symbol("+")) advance();  // an unsigned integer may carry a sign
           const Token& dimension = peek();
           if (dimension.kind != Tok::Int) {
             throw_error("syntax_error", "VECTOR requires an integer dimension");
@@ -520,6 +525,7 @@ class Parser {
     }
     if (is_keyword("limit")) {
       advance();
+      if (is_symbol("+")) advance();  // an unsigned integer may carry a sign
       const Token& limit = peek();
       if (limit.kind != Tok::Int) throw_error("syntax_error", "LIMIT requires an integer");
       advance();
@@ -547,8 +553,12 @@ class Parser {
         throw_error("invalid_vector", "L2_DISTANCE requires a vector literal");
       }
       expr.distance_vector = std::move(literal.vector);
+      // The default column name of an unaliased distance projection is the
+      // expression text. It must stop at the closing parenthesis: the token
+      // that follows it is usually FROM, which is not part of the expression.
+      const size_t close_end = peek().end;
       expect_symbol(")");
-      expr.text = sql_.substr(start, peek().end - start);
+      expr.text = sql_.substr(start, close_end - start);
       while (!expr.text.empty() && expr.text.back() == ' ') expr.text.pop_back();
     } else {
       expr.kind = Expr::Kind::ColumnRef;
